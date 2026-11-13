@@ -153,6 +153,4 @@ streamlit run app.py
 * **v2 (Planned):** Contributor profiling (analyzing a developer's past merged PRs + interactive 3-question Gemini onboarding CLI), ChromaDB vector memory for similar past issues/tests, and Tree-sitter AST symbol indexing.
 * **v3 (Planned):** GitHub Actions webhook automation (`issues.opened` / `pull_request`), Kubernetes Job execution backend for heavy integration suites, and a FastAPI + React observability dashboard.
 
-```
-
 ![Kensho UI](docs/kensho-ui.png)
