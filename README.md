@@ -1,1 +1,2 @@
-Something is cooking here.
+version-1 
+GitHub-only ingestion (gh / PyGithub), Repo Architecture Map (reads .md files + folder tree once), LiteLLM router (Gemini free tier + Groq fallback), Python (pytest) + Go (go test) Docker sandboxes, and a 2-retry self-correction loop.
