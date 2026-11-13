@@ -1,6 +1,8 @@
-# Kensho (v1) — Autonomous Open-Source PR Triage & Bug Reproduction Agent
-
-> **Kenshō (見性)** — *"Seeing into one's true nature / root cause."*
+<div align="center">
+  <img width="175" height="160" alt="Kensho Icon" src="https://github.com/user-attachments/assets/c90b521b-eb83-4dba-aaa3-6cc7b3cc9e42" />
+  <h1>Kensho (v1) — Autonomous Open-Source PR Triage & Bug Reproduction Agent</h1>
+  <p><em><strong>Kenshō (見性)</strong> — "Seeing into one's true nature / root cause."</em></p>
+</div>
 
 **Kensho** is a reproduction-first, stateful multi-agent engineering tool that automates issue triage, root-cause localization, and sandboxed bug verification for polyglot open-source repositories (Python primary, Go secondary).
 
