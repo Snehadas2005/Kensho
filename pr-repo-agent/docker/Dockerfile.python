@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+WORKDIR /repo
+
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pre-install pytest and Kubeflow Pipelines SDK dependencies so sandboxes start instantly
+RUN pip install --no-cache-dir pytest kfp protobuf pydantic pyyaml
+
+CMD ["pytest"]
