@@ -6,3 +6,12 @@
 .venv-2
 ./workspace
 workspace
+pr-repo-agent/__pycache__
+pr-repo-agent/core/__pycache__
+./__pycache__
+__pycache__/
+*.pyc
+*.log
+venv/
+./kensho_cli.egg-info
+pr-repo-agent/kensho_cli.egg-info

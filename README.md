@@ -1,5 +1,5 @@
 <div align="center">
-  <img width="175" height="160" alt="Kensho Icon" src="https://github.com/user-attachments/assets/c90b521b-eb83-4dba-aaa3-6cc7b3cc9e42" />
+  <img width="175" height="160" alt="Kensho Icon" src="assets/kensho-logo.png" />
   <h1>Kensho (v1) — Autonomous Open-Source PR Triage & Bug Reproduction Agent</h1>
   <p><em><strong>Kenshō (見性)</strong> — "Seeing into one's true nature / root cause."</em></p>
 </div>
@@ -8,12 +8,15 @@
 
 Unlike static PR bots that only summarize text diffs—or heavy autonomous coders that explore repositories blindly from scratch—Kensho maintains a **living architecture map** of the target codebase and proves bug reproducibility via **isolated Docker test execution** (`pytest` and `go test`).
 
+
+![Kensho UI](docs/kensho-ui.png)
+
 ---
 
 ## Core Engineering Highlights
 
 * **Living Repository Architecture Map (`core/repo_indexer.py`):** Performs an initial onboarding pass over repository documentation (`README.md`, `CONTRIBUTING.md`), build manifests (`pyproject.toml`, `go.mod`), and directory structures to build `repo_map.json`, then incrementally updates only modified modules via `git diff` as new PRs merge.
-* **Polyglot Ephemeral Docker Sandboxes (`core/sandbox.py`):** Streams target source trees and generated tests via in-memory `tar` archives (`put_archive`) into network-disabled (`--network none`), memory-capped (`1g`) containers (`repro-py` and `repro-go`) with zero host-filesystem pollution.
+* **Polyglot Ephemeral Docker Sandboxes (`core/sandbox.py`):** Streams target source trees and generated tests via in-memory `tar` archives (`put_archive`) into network-disabled (`--network none`), memory-capped (`1g`), capability-dropped (`cap_drop=ALL`, `no-new-privileges`) containers (`repro-py` and `repro-go`) with zero host-filesystem pollution.
 * **Cyclical Self-Correction Loop (`core/graph.py`):** Orchestrated with **LangGraph**, separating `TEST_ERROR` (syntax/import mistakes in generated tests) from `VERIFIED` failures (genuine `AssertionError`s or Go panics), automatically feeding `stderr` tracebacks back to the Coder agent up to `max_retries`.
 * **Deterministic Judge Guardrails:** Enforces Pydantic structured schemas across all LLM calls and blocks false-positive `VERIFIED` verdicts whenever sandbox runs time out (`exit_code == 124`) or pass (`exit_code == 0`).
 * **Semantic PR Diff Compression (`core/github_client.py`):** Filters auto-generated protobuf files (`*.pb.go`, `*_pb2.py`), lockfiles, and vendor directories before LLM inference.
@@ -66,11 +69,14 @@ Unlike static PR bots that only summarize text diffs—or heavy autonomous coder
 ## Project Structure
 
 ```text
-pr-repro-agent/
+pr-repo-agent/
 ├── main.py                  # Typer + Rich CLI (`index`, `sync`, `issue`, `pr`)
 ├── app.py                   # Streamlit UI for inspecting traces, logs & Markdown reports
 ├── requirements.txt         # Python dependencies
+├── .env.example             # Copy to .env and fill in your keys
+├── tests/                   # Unit tests for judge guards & tools (`pytest`)
 ├── core/
+│   ├── guards.py            # Deterministic judge guardrails & retry policy
 │   ├── schemas.py           # Pydantic models & LangGraph TypedDict state
 │   ├── llm.py               # LiteLLM multi-model router with structured output validation
 │   ├── repo_indexer.py      # Initial & incremental SHA-based architecture mapper
@@ -97,8 +103,8 @@ pr-repro-agent/
 ### 2. Installation & Environment Setup
 
 ```bash
-git clone [https://github.com/](https://github.com/)<your-username>/Triage-Agent.git
-cd Triage-Agent/pr-repro-agent
+git clone https://github.com/Snehadas2005/Kensho.git
+cd Kensho/pr-repo-agent
 
 python -m venv .venv
 source .venv/bin/activate  # On Windows Git Bash: source .venv/Scripts/activate
@@ -106,19 +112,22 @@ pip install -r requirements.txt
 
 ```
 
-Create a `.env` file in `pr-repro-agent/`:
+Copy the example env file and fill in your keys:
+
+```bash
+cp .env.example .env
+```
 
 ```env
 GEMINI_API_KEY=your_google_ai_studio_key
 GITHUB_TOKEN=your_github_personal_access_token
-
 ```
 
 ### 3. Clone Target Repository & Build Pre-Warmed Sandboxes
 
 ```bash
 mkdir -p workspace
-git clone --depth 50 [https://github.com/kubeflow/pipelines.git](https://github.com/kubeflow/pipelines.git) workspace/pipelines
+git clone --depth 50 https://github.com/kubeflow/pipelines.git workspace/pipelines
 
 docker build -t repro-py:latest -f docker/Dockerfile.python .
 docker build -t repro-go:latest -f docker/Dockerfile.go .
@@ -143,14 +152,15 @@ python main.py pr 1333
 # 5. Launch the visual trace & report viewer
 streamlit run app.py
 
+# 6. Run the unit tests
+pytest
 ```
 
 ---
 
 ## Roadmap
 
-* **v1 (Current):** Persistent `repo_map.json` with incremental SHA sync, polyglot Python/Go Docker sandboxes, 4-node LangGraph self-correction loop, Rich CLI, and Streamlit trace viewer.
+* **v1 (Current, `v1.0.0-beta.1`):** Persistent `repo_map.json` with incremental SHA sync, polyglot Python/Go Docker sandboxes, 4-node LangGraph self-correction loop, Rich CLI, and Streamlit trace viewer.
 * **v2 (Planned):** Contributor profiling (analyzing a developer's past merged PRs + interactive 3-question Gemini onboarding CLI), ChromaDB vector memory for similar past issues/tests, and Tree-sitter AST symbol indexing.
-* **v3 (Planned):** GitHub Actions webhook automation (`issues.opened` / `pull_request`), Kubernetes Job execution backend for heavy integration suites, and a FastAPI + React observability dashboard.
-
-![Kensho UI](docs/kensho-ui.png)
+* **v3 (Planned):** GitHub Actions webhook automation (`issues.opened` / `pull_request`), Kubernetes Job execution backend for heavy integration suites.
+* **v4 (Planned):** FastAPI + React observability dashboard.
