@@ -1,33 +1,21 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kensho-cli"
-version = "1.0.0"
-description = "Kensho (v1) — Autonomous Open-Source PR Triage & Bug Reproduction Agent"
-readme = "README.md"
+name = "kensho"
+description = "Autonomous open-source PR triage and bug reproduction agent"
 requires-python = ">=3.11"
-dependencies = [
-    "litellm>=1.50.0",
-    "pydantic>=2.9.0",
-    "langgraph>=0.2.45",
-    "docker>=7.1.0",
-    "PyGithub>=2.4.0",
-    "typer>=0.12.5",
-    "rich>=13.9.0",
-    "python-dotenv>=1.0.1",
-    "streamlit>=1.39.0",
-]
+dynamic = ["version", "dependencies"]
 
 [project.scripts]
 kensho = "main:app"
-git-kensho = "main:app"
+git-kensho = "main:app"   # lets you type: git kensho issue 13401
 
 [tool.setuptools]
-py-modules = ["main", "app"]
+py-modules = ["main"]
 packages = ["core"]
 
-[tool.setuptools]
-py-modules = ["main", "app", "ui_theme"]
-packages = ["core"]
+[tool.setuptools.dynamic]
+version = { attr = "core.__version__" }
+dependencies = { file = ["requirements.txt"] }

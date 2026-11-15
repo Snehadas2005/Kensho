@@ -1,1 +1,3 @@
-VERSION = "v1.0.0"
+"""Kensho core engine."""
+
+__version__ = "1.0.0"

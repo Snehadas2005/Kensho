@@ -1,22 +1,27 @@
 <div align="center">
-  <img width="175" height="160" alt="Kensho Icon" src="assets/kensho-logo.png" />
-  <h1>Kensho (v1) — Autonomous Open-Source PR Triage & Bug Reproduction Agent</h1>
+  <img width="175" height="160" alt="Kensho Icon" src="https://github.com/user-attachments/assets/c90b521b-eb83-4dba-aaa3-6cc7b3cc9e42" />
+  <h1>Kensho — Autonomous Open-Source PR Triage & Bug Reproduction Agent</h1>
   <p><em><strong>Kenshō (見性)</strong> — "Seeing into one's true nature / root cause."</em></p>
 </div>
+
+<p align="center">
+  <a href="https://github.com/Snehadas2005/Kensho/releases/tag/v1.0.0"><img alt="release" src="https://img.shields.io/badge/release-v1.0.0-7C83FD" /></a>
+  <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-blue" />
+  <img alt="docker" src="https://img.shields.io/badge/sandbox-docker-2496ED" />
+</p>
+
+![Kensho UI](docs/kensho-ui.png)
 
 **Kensho** is a reproduction-first, stateful multi-agent engineering tool that automates issue triage, root-cause localization, and sandboxed bug verification for polyglot open-source repositories (Python primary, Go secondary).
 
 Unlike static PR bots that only summarize text diffs—or heavy autonomous coders that explore repositories blindly from scratch—Kensho maintains a **living architecture map** of the target codebase and proves bug reproducibility via **isolated Docker test execution** (`pytest` and `go test`).
-
-
-![Kensho UI](docs/kensho-ui.png)
 
 ---
 
 ## Core Engineering Highlights
 
 * **Living Repository Architecture Map (`core/repo_indexer.py`):** Performs an initial onboarding pass over repository documentation (`README.md`, `CONTRIBUTING.md`), build manifests (`pyproject.toml`, `go.mod`), and directory structures to build `repo_map.json`, then incrementally updates only modified modules via `git diff` as new PRs merge.
-* **Polyglot Ephemeral Docker Sandboxes (`core/sandbox.py`):** Streams target source trees and generated tests via in-memory `tar` archives (`put_archive`) into network-disabled (`--network none`), memory-capped (`1g`), capability-dropped (`cap_drop=ALL`, `no-new-privileges`) containers (`repro-py` and `repro-go`) with zero host-filesystem pollution.
+* **Polyglot Ephemeral Docker Sandboxes (`core/sandbox.py`):** Streams target source trees and generated tests via in-memory `tar` archives (`put_archive`) into network-disabled (`--network none`), memory-capped (`1g`), capability-dropped containers (`repro-py` and `repro-go`) with zero host-filesystem pollution.
 * **Cyclical Self-Correction Loop (`core/graph.py`):** Orchestrated with **LangGraph**, separating `TEST_ERROR` (syntax/import mistakes in generated tests) from `VERIFIED` failures (genuine `AssertionError`s or Go panics), automatically feeding `stderr` tracebacks back to the Coder agent up to `max_retries`.
 * **Deterministic Judge Guardrails:** Enforces Pydantic structured schemas across all LLM calls and blocks false-positive `VERIFIED` verdicts whenever sandbox runs time out (`exit_code == 124`) or pass (`exit_code == 0`).
 * **Semantic PR Diff Compression (`core/github_client.py`):** Filters auto-generated protobuf files (`*.pb.go`, `*_pb2.py`), lockfiles, and vendor directories before LLM inference.
@@ -24,7 +29,7 @@ Unlike static PR bots that only summarize text diffs—or heavy autonomous coder
 
 ---
 
-## System Architecture (`v1`)
+## System Architecture
 
 ```text
 [1. Repo Onboarding & Sync]
@@ -73,10 +78,12 @@ pr-repo-agent/
 ├── main.py                  # Typer + Rich CLI (`index`, `sync`, `issue`, `pr`)
 ├── app.py                   # Streamlit UI for inspecting traces, logs & Markdown reports
 ├── requirements.txt         # Python dependencies
-├── .env.example             # Copy to .env and fill in your keys
-├── tests/                   # Unit tests for judge guards & tools (`pytest`)
+├── .env.example             # Template for API keys
+├── .streamlit/config.toml   # Streamlit theme
+├── tests/                   # Unit tests for judge guards, path safety & diff filtering
 ├── core/
-│   ├── guards.py            # Deterministic judge guardrails & retry policy
+│   ├── __init__.py          # Package version
+│   ├── errors.py            # Friendly error messages (Docker / GitHub / LLM)
 │   ├── schemas.py           # Pydantic models & LangGraph TypedDict state
 │   ├── llm.py               # LiteLLM multi-model router with structured output validation
 │   ├── repo_indexer.py      # Initial & incremental SHA-based architecture mapper
@@ -112,7 +119,7 @@ pip install -r requirements.txt
 
 ```
 
-Copy the example env file and fill in your keys:
+Copy the template and fill in your keys:
 
 ```bash
 cp .env.example .env
@@ -140,7 +147,7 @@ docker build -t repro-go:latest -f docker/Dockerfile.go .
 # 1. Build initial Repo Architecture Map (one-time)
 python main.py index --repo kubeflow/pipelines
 
-# 2. Incrementally sync map after pulling new commits
+# 2. Pull the latest commits and incrementally update the map
 python main.py sync
 
 # 3. Triage & reproduce a GitHub Issue
@@ -156,11 +163,13 @@ streamlit run app.py
 pytest
 ```
 
+> Run all commands from inside `pr-repo-agent/`, since `workspace/` and `.streamlit/` are resolved relative to it.
+
 ---
 
 ## Roadmap
 
-* **v1 (Current, `v1.0.0-beta.1`):** Persistent `repo_map.json` with incremental SHA sync, polyglot Python/Go Docker sandboxes, 4-node LangGraph self-correction loop, Rich CLI, and Streamlit trace viewer.
+* **v1.0.0 (Current):** Persistent `repo_map.json` with incremental SHA sync, polyglot Python/Go Docker sandboxes, 4-node LangGraph self-correction loop, Rich CLI, and Streamlit trace viewer.
 * **v2 (Planned):** Contributor profiling (analyzing a developer's past merged PRs + interactive 3-question Gemini onboarding CLI), ChromaDB vector memory for similar past issues/tests, and Tree-sitter AST symbol indexing.
-* **v3 (Planned):** GitHub Actions webhook automation (`issues.opened` / `pull_request`), Kubernetes Job execution backend for heavy integration suites.
+* **v3 (Planned):** GitHub Actions webhook automation (`issues.opened` / `pull_request`) and a Kubernetes Job execution backend for heavy integration suites.
 * **v4 (Planned):** FastAPI + React observability dashboard.

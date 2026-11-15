@@ -133,8 +133,9 @@ class PolyglotSandbox:
                 environment=env or {},
                 network_disabled=True,
                 mem_limit="1g",
+                memswap_limit="1g",
                 nano_cpus=2_000_000_000,  # 2 CPUs
-                pids_limit=512,
+                pids_limit=1024,  # generous: Go builds spawn many threads
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges"],
             )

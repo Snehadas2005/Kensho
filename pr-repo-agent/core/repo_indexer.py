@@ -30,20 +30,19 @@ def _run_git(repo_dir: Path, args: list[str]) -> str:
         raise RuntimeError(f"Git error in {repo_dir}: {res.stderr.strip()}")
     return res.stdout.strip()
 
-def _get_tree_summary(repo_dir: Path, max_depth: int = 3, max_lines: int = 300) -> str:
-    """Breadth-first directory listing, so top-level modules are never cut off by the line limit."""
-    dirs_found: list[tuple[int, str]] = []
-    for root, dirs, _files in os.walk(repo_dir):
-        rel_root = Path(root).relative_to(repo_dir)  # relative: a parent folder named "build" can't hide the repo
+def _get_tree_summary(repo_dir: Path, max_depth: int = 3, max_lines: int = 400) -> str:
+    """Lists directories up to `max_depth`, shallowest first so truncation never drops top-level folders."""
+    entries: list[tuple[int, str]] = []
+    for root, dirs, _ in os.walk(repo_dir):
         dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
-        if len(rel_root.parts) >= max_depth:
+        rel = Path(root).relative_to(repo_dir)
+        depth = len(rel.parts)
+        if depth >= max_depth:
             dirs[:] = []
-            continue
-        for d in dirs:
-            rel = rel_root / d
-            dirs_found.append((len(rel.parts), rel.as_posix() + "/"))
-    dirs_found.sort()
-    return "\n".join(p for _, p in dirs_found[:max_lines])
+        if depth > 0:
+            entries.append((depth, f"{rel.as_posix()}/"))
+    entries.sort()
+    return "\n".join(line for _, line in entries[:max_lines])
 
 
 def _read_key_docs(repo_dir: Path) -> str:
@@ -85,7 +84,8 @@ def build_initial_map(repo_name: str, repo_dir: Path, output_path: Path) -> Repo
 def sync_repo_map(repo_dir: Path, map_path: Path) -> RepoArchitectureMap:
     """Incrementally updates the repo map using only diffs since last_indexed_sha."""
     existing = RepoArchitectureMap.model_validate_json(map_path.read_text(encoding="utf-8"))
-    _run_git(repo_dir, ["pull", "--ff-only"])  # `fetch` alone never moves HEAD
+    # `fetch` alone never moves HEAD, so fast-forward to actually pick up new merges.
+    _run_git(repo_dir, ["pull", "--ff-only"])
     new_sha = _run_git(repo_dir, ["rev-parse", "HEAD"])
 
     if new_sha == existing.last_indexed_sha:
@@ -94,7 +94,7 @@ def sync_repo_map(repo_dir: Path, map_path: Path) -> RepoArchitectureMap:
     try:
         changed_files = _run_git(repo_dir, ["diff", "--name-only", existing.last_indexed_sha, new_sha])
     except RuntimeError:
-        # Old SHA fell out of the shallow (--depth 50) history: rebuild from scratch instead of failing.
+        # Old SHA fell out of a shallow clone's history -> rebuild instead of failing.
         return build_initial_map(existing.repo_name, repo_dir, map_path)
     if not changed_files.strip():
         existing.last_indexed_sha = new_sha

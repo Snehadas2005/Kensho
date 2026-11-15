@@ -1,17 +1,40 @@
 from pathlib import Path
 from langgraph.graph import StateGraph, END
-from core.llm import call_structured_llm, get_last_model
-from core.guards import deterministic_verdict, should_retry
+from core.llm import call_structured_llm
 from core.schemas import AgentState, TriageDecision, ReproTestDraft, JudgeVerdict
 from core.tools import read_file_snippet, grep_codebase
 from core.sandbox import PolyglotSandbox
 
 
+INFRA_ERROR_MARKER = "Sandbox execution error"
+
+
+def is_infra_failure(exit_code: int, stderr: str) -> bool:
+    """Timeouts and Docker/runtime errors: retrying the coder cannot fix these."""
+    return exit_code == 124 or INFRA_ERROR_MARKER in (stderr or "")
+
+
+def deterministic_verdict(exit_code: int, stderr: str) -> JudgeVerdict | None:
+    """Verdicts that must never be left to the LLM. Returns None when the LLM should judge."""
+    if is_infra_failure(exit_code, stderr):
+        return JudgeVerdict(
+            status="TEST_ERROR",
+            root_cause_summary="Sandbox execution timed out or hit a container runtime error.",
+            suggested_fix_direction="Check that Docker is running and the images are built, or narrow the target package.",
+            github_markdown_report="Sandbox execution did not finish, so the bug could not be verified.",
+        )
+    if exit_code == 0:
+        return JudgeVerdict(
+            status="NOT_REPRODUCED",
+            root_cause_summary="The generated test passed, so the reported behavior was not triggered.",
+            suggested_fix_direction="Refine the reproduction with more details from the issue, or the bug may already be fixed.",
+            github_markdown_report="I could not reproduce this: the generated test passed (exit code 0).",
+        )
+    return None
+
+
 def build_triage_graph(repo_dir: Path):
     sandbox = PolyglotSandbox(repo_dir=repo_dir, timeout_sec=180)
-
-    def _models(state: AgentState, node: str) -> dict:
-        return {**state.get("models_used", {}), node: get_last_model()}
 
     def triage_node(state: AgentState) -> dict:
         system_prompt = (
@@ -34,7 +57,6 @@ def build_triage_graph(repo_dir: Path):
             "search_keywords": decision.search_keywords,
             "hypothesis": decision.hypothesis,
             "retry_count": 0,
-            "models_used": _models(state, "triage"),
         }
 
     def explorer_coder_node(state: AgentState) -> dict:
@@ -85,7 +107,6 @@ def build_triage_graph(repo_dir: Path):
         return {
             "code_context": code_context,
             "test_code": draft.test_code,
-            "models_used": _models(state, "coder"),
         }
 
     def sandbox_node(state: AgentState) -> dict:
@@ -103,11 +124,10 @@ def build_triage_graph(repo_dir: Path):
         }
 
     def judge_node(state: AgentState) -> dict:
-        # Deterministic guardrails (core/guards.py): timeouts, Docker errors and passing runs never reach the LLM
-        early = deterministic_verdict(state)
-        if early is not None:
-            return {"verdict": early.model_dump()}
-
+        # Deterministic guardrail: never let the LLM decide timeouts, runtime errors or passing runs
+        forced = deterministic_verdict(state["exit_code"], state["stderr"])
+        if forced is not None:
+            return {"verdict": forced.model_dump()}
         system_prompt = (
             "You are a Principal Engineer verifying a bug reproduction run inside an isolated Docker sandbox. "
             "Compare the original issue/PR description with the actual pytest/go test output.\n"
@@ -124,10 +144,15 @@ def build_triage_graph(repo_dir: Path):
             f"STDERR:\n{state['stderr']}"
         )
         verdict = call_structured_llm(system_prompt, user_prompt, JudgeVerdict)
-        return {"verdict": verdict.model_dump(), "models_used": _models(state, "judge")}
+        return {"verdict": verdict.model_dump()}
 
     def route_after_judge(state: AgentState) -> str:
-        return "retry_coder" if should_retry(state) else "done"
+        status = state["verdict"].get("status", "NOT_REPRODUCED")
+        if is_infra_failure(state["exit_code"], state["stderr"]):
+            return "done"
+        if status == "TEST_ERROR" and state["retry_count"] <= state["max_retries"]:
+            return "retry_coder"
+        return "done"
 
     workflow = StateGraph(AgentState)
     workflow.add_node("triage", triage_node)

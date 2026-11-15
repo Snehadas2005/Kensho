@@ -43,7 +43,8 @@ def fetch_github_item(repo_name: str, number: int, item_type: str = "issue") -> 
     if item_type == "issue":
         issue = repo.get_issue(number=number)
         comments_text = "\n".join(
-            f"- @{c.user.login}: {c.body[:600]}" for c in list(issue.get_comments())[:5]
+            f"- @{c.user.login if c.user else 'ghost'}: {(c.body or '')[:600]}"
+            for c in list(issue.get_comments())[:5]
         )
         full_body = f"{issue.body or ''}\n\nRecent Comments:\n{comments_text}".strip()
         return GitHubWorkItem(

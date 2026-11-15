@@ -6,8 +6,9 @@ SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", "vendor"}
 
 def read_file_snippet(repo_dir: Path, rel_path: str, start_line: int = 1, max_lines: int = 180) -> str:
     """Safely reads a bounded slice of lines from a file inside the repository."""
-    target = (repo_dir / rel_path).resolve()
-    if not str(target).startswith(str(repo_dir.resolve())) or not target.is_file():
+    base = repo_dir.resolve()
+    target = (base / rel_path).resolve()
+    if not target.is_relative_to(base) or not target.is_file():
         return f"[File not found: {rel_path}]"
 
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
