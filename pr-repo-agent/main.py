@@ -1,4 +1,9 @@
 import json
+import os
+import socket
+import subprocess
+import sys
+import webbrowser
 from pathlib import Path
 import typer
 from rich.console import Console
@@ -13,11 +18,33 @@ from core.graph import build_triage_graph
 app = typer.Typer(help="Kensho (v1) — Autonomous PR Triage & Bug Reproduction Agent")
 console = Console()
 
-WORKSPACE_DIR = Path("workspace")
+BASE_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = BASE_DIR / "workspace"
 DEFAULT_REPO_DIR = WORKSPACE_DIR / "pipelines"
 DEFAULT_MAP_PATH = WORKSPACE_DIR / "repo_map.json"
 LAST_RUN_PATH = WORKSPACE_DIR / "last_run.json"
 
+
+def _is_port_in_use(port: int = 8501) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("localhost", port)) == 0
+
+
+def _launch_streamlit():
+    app_file = BASE_DIR / "app.py"
+    if _is_port_in_use(8501):
+        console.print("[bold cyan]Streamlit already running on http://localhost:8501 — opening tab...[/bold cyan]")
+        webbrowser.open("http://localhost:8501")
+        return
+
+    console.print("[bold cyan]Starting Kensho trace viewer in background at http://localhost:8501...[/bold cyan]")
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", str(app_file)],
+        creationflags=creationflags,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 @app.command()
 def index(
@@ -46,9 +73,17 @@ def sync(
     console.print(f"[bold green]Synced![/bold green] Latest SHA: [yellow]{updated.last_indexed_sha[:7]}[/yellow]")
 
 
-def _execute_agent(repo: str, number: int, item_type: str, repo_dir: Path, map_path: Path, max_retries: int):
+def _execute_agent(
+    repo: str,
+    number: int,
+    item_type: str,
+    repo_dir: Path,
+    map_path: Path,
+    max_retries: int,
+    cli: bool,
+):
     if not map_path.exists():
-        console.print("[bold red]repo_map.json not found.[/bold red] Run `python main.py index` first.")
+        console.print("[bold red]repo_map.json not found.[/bold red] Run `git kensho index` first.")
         raise typer.Exit(code=1)
 
     repo_map_json = map_path.read_text(encoding="utf-8")
@@ -74,8 +109,11 @@ def _execute_agent(repo: str, number: int, item_type: str, repo_dir: Path, map_p
     with console.status("[bold cyan]Running Triage -> Explorer -> Docker Sandbox -> Judge loop...[/bold cyan]"):
         final_state = graph.invoke(initial_state)
 
-    # Save trace for Streamlit viewer
     LAST_RUN_PATH.write_text(json.dumps(final_state, indent=2), encoding="utf-8")
+
+    if not cli:
+        _launch_streamlit()
+        return
 
     verdict = final_state.get("verdict", {})
     status = verdict.get("status", "UNKNOWN")
@@ -104,10 +142,11 @@ def issue(
     repo: str = typer.Option("kubeflow/pipelines", help="GitHub owner/repo"),
     repo_dir: Path = typer.Option(DEFAULT_REPO_DIR),
     map_path: Path = typer.Option(DEFAULT_MAP_PATH),
-    max_retries: int = typer.Option(2, help="Max self-correction retries on test syntax/import errors"),
+    max_retries: int = typer.Option(2, help="Max self-correction retries"),
+    cli: bool = typer.Option(False, "--cli", help="Print output in terminal instead of opening Streamlit UI"),
 ):
-    """Triages and reproduces a GitHub Issue inside an isolated Docker sandbox."""
-    _execute_agent(repo, number, "issue", repo_dir, map_path, max_retries)
+    """Triages and reproduces a GitHub Issue (opens Streamlit UI by default; pass --cli for terminal output)."""
+    _execute_agent(repo, number, "issue", repo_dir, map_path, max_retries, cli)
 
 
 @app.command()
@@ -117,9 +156,16 @@ def pr(
     repo_dir: Path = typer.Option(DEFAULT_REPO_DIR),
     map_path: Path = typer.Option(DEFAULT_MAP_PATH),
     max_retries: int = typer.Option(2, help="Max self-correction retries"),
+    cli: bool = typer.Option(False, "--cli", help="Print output in terminal instead of opening Streamlit UI"),
 ):
-    """Triages a GitHub Pull Request diff and runs sandbox verification."""
-    _execute_agent(repo, number, "pr", repo_dir, map_path, max_retries)
+    """Triages a GitHub Pull Request (opens Streamlit UI by default; pass --cli for terminal output)."""
+    _execute_agent(repo, number, "pr", repo_dir, map_path, max_retries, cli)
+
+
+@app.command()
+def ui():
+    """Opens the Streamlit viewer with the most recent run trace."""
+    _launch_streamlit()
 
 
 if __name__ == "__main__":

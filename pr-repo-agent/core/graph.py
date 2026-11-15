@@ -1,6 +1,7 @@
 from pathlib import Path
 from langgraph.graph import StateGraph, END
-from core.llm import call_structured_llm
+from core.llm import call_structured_llm, get_last_model
+from core.guards import deterministic_verdict, should_retry
 from core.schemas import AgentState, TriageDecision, ReproTestDraft, JudgeVerdict
 from core.tools import read_file_snippet, grep_codebase
 from core.sandbox import PolyglotSandbox
@@ -8,6 +9,9 @@ from core.sandbox import PolyglotSandbox
 
 def build_triage_graph(repo_dir: Path):
     sandbox = PolyglotSandbox(repo_dir=repo_dir, timeout_sec=180)
+
+    def _models(state: AgentState, node: str) -> dict:
+        return {**state.get("models_used", {}), node: get_last_model()}
 
     def triage_node(state: AgentState) -> dict:
         system_prompt = (
@@ -30,6 +34,7 @@ def build_triage_graph(repo_dir: Path):
             "search_keywords": decision.search_keywords,
             "hypothesis": decision.hypothesis,
             "retry_count": 0,
+            "models_used": _models(state, "triage"),
         }
 
     def explorer_coder_node(state: AgentState) -> dict:
@@ -80,6 +85,7 @@ def build_triage_graph(repo_dir: Path):
         return {
             "code_context": code_context,
             "test_code": draft.test_code,
+            "models_used": _models(state, "coder"),
         }
 
     def sandbox_node(state: AgentState) -> dict:
@@ -97,16 +103,11 @@ def build_triage_graph(repo_dir: Path):
         }
 
     def judge_node(state: AgentState) -> dict:
-        # Deterministic Guardrail: Never allow LLM to hallucinate VERIFIED on timeouts or passing runs
-        if state["exit_code"] == 124 or "Sandbox execution error" in state["stderr"]:
-            return {
-                "verdict": JudgeVerdict(
-                    status="TEST_ERROR",
-                    root_cause_summary="Sandbox execution timed out or encountered a container runtime error.",
-                    suggested_fix_direction="Increase sandbox timeout or narrow the target Go package path.",
-                    github_markdown_report="Sandbox execution timed out before test verification completed.",
-                ).model_dump()
-            }
+        # Deterministic guardrails (core/guards.py): timeouts, Docker errors and passing runs never reach the LLM
+        early = deterministic_verdict(state)
+        if early is not None:
+            return {"verdict": early.model_dump()}
+
         system_prompt = (
             "You are a Principal Engineer verifying a bug reproduction run inside an isolated Docker sandbox. "
             "Compare the original issue/PR description with the actual pytest/go test output.\n"
@@ -123,13 +124,10 @@ def build_triage_graph(repo_dir: Path):
             f"STDERR:\n{state['stderr']}"
         )
         verdict = call_structured_llm(system_prompt, user_prompt, JudgeVerdict)
-        return {"verdict": verdict.model_dump()}
+        return {"verdict": verdict.model_dump(), "models_used": _models(state, "judge")}
 
     def route_after_judge(state: AgentState) -> str:
-        status = state["verdict"].get("status", "NOT_REPRODUCED")
-        if status == "TEST_ERROR" and state["retry_count"] <= state["max_retries"]:
-            return "retry_coder"
-        return "done"
+        return "retry_coder" if should_retry(state) else "done"
 
     workflow = StateGraph(AgentState)
     workflow.add_node("triage", triage_node)

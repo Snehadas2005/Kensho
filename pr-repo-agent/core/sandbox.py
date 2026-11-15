@@ -133,6 +133,10 @@ class PolyglotSandbox:
                 environment=env or {},
                 network_disabled=True,
                 mem_limit="1g",
+                nano_cpus=2_000_000_000,  # 2 CPUs
+                pids_limit=512,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges"],
             )
             tar_bytes = self._build_repo_tar(test_rel_path, test_code)
             container.put_archive("/repo", tar_bytes)
