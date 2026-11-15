@@ -12,7 +12,10 @@ from core import __version__
 from core.errors import friendly_error
 from core.repo_indexer import build_initial_map, sync_repo_map
 from core.github_client import fetch_github_item
+from core.git_context import detect_repo_context
+from core.stack_detector import StackSpec, detect_stack, ensure_sandbox_image
 from core.graph import build_triage_graph
+
 
 app = typer.Typer(help=f"Kensho (v{__version__}) — Autonomous PR Triage & Bug Reproduction Agent")
 console = Console()
@@ -37,6 +40,35 @@ def _fail(exc: Exception) -> None:
     console.print(Panel(friendly_error(exc), title="Error", border_style="red"))
     raise typer.Exit(code=1)
 
+@app.command()
+def init(
+    rebuild_image: bool = typer.Option(False, "--rebuild-image", help="Force rebuild of the cached repo Docker image"),
+):
+    """Detects fork/upstream remotes, indexes repo architecture, and provisions a cached Docker sandbox."""
+    ctx = detect_repo_context()
+    fork_badge = f"fork [cyan]{ctx.origin_repo}[/cyan] -> upstream [green]{ctx.upstream_repo}[/green]" if ctx.is_fork else f"[green]{ctx.upstream_repo}[/green]"
+    console.print(Panel(
+        f"[bold]Repository:[/bold] {fork_badge}\n"
+        f"[bold]Contributor:[/bold] @{ctx.github_username}\n"
+        f"[bold]State Dir:[/bold] {ctx.kensho_dir}",
+        title="Kensho v2 Context Detected",
+    ))
+
+    with console.status(f"[bold cyan]Indexing {ctx.upstream_repo} architecture...[/bold cyan]"):
+        repo_map = build_initial_map(ctx.upstream_repo, ctx.repo_root, ctx.map_path)
+
+    with console.status("[bold cyan]Detecting tech stack & provisioning cached Docker sandbox...[/bold cyan]"):
+        spec = detect_stack(ctx.repo_root, ctx.upstream_repo)
+        ctx.stack_path.write_text(spec.model_dump_json(indent=2), encoding="utf-8")
+        (ctx.kensho_dir / "Dockerfile.sandbox").write_text(spec.dockerfile_content, encoding="utf-8")
+        image_tag = ensure_sandbox_image(ctx.repo_root, spec, force_rebuild=rebuild_image)
+
+    console.print(Panel(
+        f"[bold green]Indexed {len(repo_map.modules)} modules[/bold green] (SHA [yellow]{repo_map.last_indexed_sha[:7]}[/yellow])\n"
+        f"[bold]Detected Stack:[/bold] {', '.join(spec.detected_languages)}\n"
+        f"[bold]Cached Sandbox Image:[/bold] [cyan]{image_tag}[/cyan]",
+        title="Repository Ready",
+    ))
 
 @app.command()
 def index(

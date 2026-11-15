@@ -18,10 +18,11 @@ class SandboxResult(BaseModel):
 
 
 class PolyglotSandbox:
-    def __init__(self, repo_dir: Path, timeout_sec: int = 60):
+    def __init__(self, repo_dir: Path, timeout_sec: int = 180, stack_spec=None):
         self.repo_dir = repo_dir.resolve()
         self.timeout_sec = timeout_sec
-        self.client = docker.from_env()
+        self.stack_spec = stack_spec
+        self._client = None
 
     def run_repro(
         self,

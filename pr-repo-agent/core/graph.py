@@ -33,8 +33,8 @@ def deterministic_verdict(exit_code: int, stderr: str) -> JudgeVerdict | None:
     return None
 
 
-def build_triage_graph(repo_dir: Path):
-    sandbox = PolyglotSandbox(repo_dir=repo_dir, timeout_sec=180)
+def build_triage_graph(repo_dir: Path, stack_spec=None):
+    sandbox = PolyglotSandbox(repo_dir=repo_dir, timeout_sec=180, stack_spec=stack_spec)
 
     def triage_node(state: AgentState) -> dict:
         system_prompt = (

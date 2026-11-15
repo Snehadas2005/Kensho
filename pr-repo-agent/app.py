@@ -1,96 +1,109 @@
 import json
+import os
+import time
+from datetime import datetime
 from pathlib import Path
+
 import streamlit as st
 
-from core import __version__
-from core.errors import friendly_error
+from core import VERSION
+from core.git_context import detect_repo_context
 from core.github_client import fetch_github_item
 from core.graph import build_triage_graph
+from core.guards import is_sandbox_error, is_timeout
+from core.stack_detector import StackSpec
+from ui_theme import brand_header_html, build_css, find_logo
 
-st.set_page_config(page_title="Kensho", page_icon="🔍", layout="wide")
-
-# Fixed dark theme: hide the settings menu (which holds the light/dark switch) and the deploy button
-st.markdown(
-    """
-    <style>
-    [data-testid="stMainMenu"], [data-testid="stAppDeployButton"], .stAppDeployButton,
-    #MainMenu { display: none !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+_logo = find_logo()
+st.set_page_config(
+    page_title="Kensho",
+    page_icon=str(_logo) if _logo else "🔍",
+    layout="wide",
 )
 
-WORKSPACE_DIR = Path(__file__).resolve().parent / "workspace"
-LAST_RUN_PATH = WORKSPACE_DIR / "last_run.json"
-PENDING_RUN_PATH = WORKSPACE_DIR / "pending_run.json"
+# Resolve active Git repository context dynamically; fall back to current repo if outside a git tree
+try:
+    CTX = detect_repo_context()
+    REPO_DIR = CTX.repo_root
+    MAP_PATH = CTX.map_path
+    STACK_PATH = CTX.stack_path
+    LAST_RUN_PATH = CTX.last_run_path
+    DEFAULT_UPSTREAM = CTX.upstream_repo
+except RuntimeError:
+    CTX = None
+    REPO_DIR = Path.cwd().resolve()
+    _fallback_dir = REPO_DIR / ".kensho"
+    MAP_PATH = _fallback_dir / "repo_map.json"
+    STACK_PATH = _fallback_dir / "stack_spec.json"
+    LAST_RUN_PATH = _fallback_dir / "last_run.json"
+    DEFAULT_UPSTREAM = "Snehadas2005/Kensho"
 
-# Sidebar defaults; a pending request written by `kensho issue <n>` overrides them once per session
-st.session_state.setdefault("repo_name", "kubeflow/pipelines")
-st.session_state.setdefault("item_type", "issue")
-st.session_state.setdefault("item_number", 13401)
-st.session_state.setdefault("max_retries", 2)
-st.session_state.setdefault("repo_dir", str(WORKSPACE_DIR / "pipelines"))
-st.session_state.setdefault("map_path", str(WORKSPACE_DIR / "repo_map.json"))
-
-if "pending_checked" not in st.session_state:
-    st.session_state["pending_checked"] = True
-    if PENDING_RUN_PATH.exists():
-        try:
-            st.session_state.update(json.loads(PENDING_RUN_PATH.read_text(encoding="utf-8")))
-            st.session_state["autorun"] = True
-        except (json.JSONDecodeError, OSError):
-            pass
-        finally:
-            PENDING_RUN_PATH.unlink(missing_ok=True)
-
-REPO_DIR = Path(st.session_state["repo_dir"])
-MAP_PATH = Path(st.session_state["map_path"])
-
-NODE_LABELS = {
+STEP_LABELS = {
     "triage": "Triage & localization",
     "explorer_coder": "Writing reproduction test",
     "sandbox": "Running in Docker sandbox",
     "judge": "Judging result",
 }
 
-# ---------- Header ----------
-st.title("Kensho")
-st.caption(f"Autonomous PR triage & bug reproduction · v{__version__}")
+st.markdown(build_css(st.session_state.get("light_mode", False)), unsafe_allow_html=True)
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("Target")
-    repo_name = st.text_input("GitHub repository", key="repo_name")
-    item_type = st.selectbox("Item type", ["issue", "pr"], key="item_type")
-    item_number = st.number_input("Issue / PR number", min_value=1, step=1, key="item_number")
-    max_retries = st.slider("Max self-correction retries", 0, 3, key="max_retries")
-    run_btn = st.button("Run triage & repro", type="primary", use_container_width=True)
-    run_btn = run_btn or st.session_state.pop("autorun", False)
 
-    if MAP_PATH.exists():
+def _load_stack_spec() -> StackSpec | None:
+    if STACK_PATH.exists():
         try:
-            repo_map = json.loads(MAP_PATH.read_text(encoding="utf-8"))
-            st.divider()
-            st.caption("Repo map")
-            st.markdown(
-                f"SHA `{repo_map.get('last_indexed_sha', '')[:7]}` · "
-                f"{len(repo_map.get('modules', []))} modules"
-            )
-        except json.JSONDecodeError:
-            st.warning("`repo_map.json` is unreadable. Re-run `kensho index`.")
+            return StackSpec.model_validate_json(STACK_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
 
 
-def run_agent() -> dict | None:
-    """Runs the graph, streaming node progress into the UI. Returns final state or None on failure."""
-    try:
-        with st.status("Running agent loop…", expanded=True) as status:
-            st.write("Fetching item from GitHub…")
-            work_item = fetch_github_item(repo_name, int(item_number), item_type=item_type)
-            graph = build_triage_graph(REPO_DIR)
+def classify(state: dict) -> tuple[str, str, str]:
+    """Returns (label, banner_kind, explanation). Timeouts and Docker errors get their own states."""
+    status = (state.get("verdict") or {}).get("status", "UNKNOWN")
+    if is_timeout(state):
+        return "TIMEOUT", "warning", "The sandbox timed out before the test finished. Nothing was verified."
+    if is_sandbox_error(state):
+        return "SANDBOX ERROR", "error", "The Docker sandbox failed to run. Check Docker and the cached sandbox image."
+    if status == "VERIFIED":
+        return "VERIFIED", "success", "The generated test failed in the way the report describes."
+    if status == "NOT_REPRODUCED":
+        return "NOT REPRODUCED", "warning", "The generated test passed, so the bug was not triggered."
+    if status == "TEST_ERROR":
+        return "TEST ERROR", "error", "The generated test itself was broken (syntax, imports or setup)."
+    return "UNKNOWN", "info", "No verdict available."
+
+
+def show_banner(kind: str, text: str) -> None:
+    {"success": st.success, "warning": st.warning, "error": st.error}.get(kind, st.info)(text)
+
+
+def preflight() -> list[str]:
+    problems = []
+    if not MAP_PATH.exists():
+        problems.append("`.kensho/repo_map.json` not found. Run `git kensho init` in your terminal first.")
+    if not REPO_DIR.exists():
+        problems.append(f"Repository path `{REPO_DIR}` not found.")
+    if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+        problems.append("`GEMINI_API_KEY` is not set. Add it to your `.env` file.")
+    return problems
+
+
+def run_agent(repo_name: str, item_type: str, item_number: int, max_retries: int) -> dict | None:
+    """Runs the graph, streaming each node's completion into a live status box."""
+    started = time.perf_counter()
+    state: dict = {}
+
+    with st.status(f"Fetching {item_type.upper()} #{item_number}…", expanded=True) as status:
+        try:
+            work_item = fetch_github_item(repo_name, item_number, item_type=item_type)
+            st.write(f"📥 Fetched: **{work_item.title}**")
+
+            stack_spec = _load_stack_spec()
+            graph = build_triage_graph(REPO_DIR, stack_spec=stack_spec)
             initial = {
                 "repo_name": repo_name,
                 "item_type": item_type,
-                "item_number": int(item_number),
+                "item_number": item_number,
                 "title": work_item.title,
                 "body": work_item.body,
                 "diff_summary": work_item.diff_summary,
@@ -98,104 +111,165 @@ def run_agent() -> dict | None:
                 "retry_count": 0,
                 "max_retries": max_retries,
             }
-            final = dict(initial)
-            for update in graph.stream(initial, stream_mode="updates"):
-                for node, delta in update.items():
-                    final.update(delta or {})
-                    label = NODE_LABELS.get(node, node)
-                    extra = ""
-                    if node == "sandbox":
-                        extra = f" (exit code {final.get('exit_code')}, attempt {final.get('retry_count')})"
-                    st.write(f"✓ {label}{extra}")
-            status.update(label="Agent loop finished", state="complete", expanded=False)
-    except Exception as exc:  # noqa: BLE001
-        st.error(friendly_error(exc))
-        return None
+            state = dict(initial)
 
-    LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LAST_RUN_PATH.write_text(json.dumps(final, indent=2, default=str), encoding="utf-8")
-    return final
+            for chunk in graph.stream(initial, stream_mode="updates"):
+                for node, update in chunk.items():
+                    state.update(update)
+                    status.update(label=f"{STEP_LABELS.get(node, node)} ✓", state="running")
+                    if node == "triage":
+                        st.write(f"🧭 Triage → `{state.get('target_language')}` in `{state.get('target_subdir')}`")
+                    elif node == "explorer_coder":
+                        st.write(f"🧪 Test drafted (attempt {state.get('retry_count', 0) + 1})")
+                    elif node == "sandbox":
+                        st.write(f"🐳 Sandbox finished: exit code `{state.get('exit_code')}` in {state.get('duration_sec')}s")
+                    elif node == "judge":
+                        st.write(f"⚖️ Verdict: **{(state.get('verdict') or {}).get('status', 'UNKNOWN')}**")
+
+            state["total_duration_sec"] = round(time.perf_counter() - started, 1)
+            state["saved_at"] = datetime.now().isoformat(timespec="seconds")
+            LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LAST_RUN_PATH.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+            status.update(label="Done", state="complete", expanded=False)
+            return state
+
+        except Exception as e:  # noqa: BLE001
+            status.update(label="Run failed", state="error", expanded=True)
+            name = type(e).__name__
+            if name == "DockerException" or ("docker" in str(e).lower() and "connect" in str(e).lower()):
+                st.error("Docker isn't reachable. Start Docker Desktop and try again.")
+            elif name == "GithubException":
+                st.error(f"GitHub API error: {getattr(e, 'data', e)}. Check the repo name, item number and `GITHUB_TOKEN`.")
+            elif name == "RuntimeError" and "fallback models failed" in str(e):
+                st.error("All LLM models failed (likely rate limits on the free tier). Wait a minute and retry.")
+                st.code(str(e), language="text")
+            else:
+                st.error(f"{name}: {e}")
+            with st.expander("Technical details"):
+                st.exception(e)
+            return None
 
 
-# ---------- State ----------
+# ───────────────────────────── Header ─────────────────────────────
+st.markdown(brand_header_html(VERSION), unsafe_allow_html=True)
+
+# ───────────────────────────── Sidebar ─────────────────────────────
+with st.sidebar:
+    st.toggle("☀️ Light mode", key="light_mode")
+    st.divider()
+    st.header("Target")
+    if CTX and CTX.is_fork:
+        st.caption(f"Fork: `{CTX.origin_repo}` → Upstream: `{CTX.upstream_repo}`")
+    repo_name = st.text_input("GitHub repository", value=DEFAULT_UPSTREAM)
+    item_type = st.selectbox("Item type", ["issue", "pr"])
+    item_number = st.number_input("Issue / PR number", min_value=1, value=1, step=1)
+    max_retries = st.slider("Max self-correction retries", 0, 3, 2)
+    run_btn = st.button("Run triage & repro", type="primary", use_container_width=True)
+
+    st.divider()
+    if MAP_PATH.exists():
+        repo_map = json.loads(MAP_PATH.read_text(encoding="utf-8"))
+        st.caption(f"Indexed SHA: `{repo_map.get('last_indexed_sha', '')[:7]}`")
+        st.caption(f"Indexed modules: {len(repo_map.get('modules', []))}")
+    else:
+        st.caption("Repo not indexed yet. Run `git kensho init`.")
+
+    stack_spec = _load_stack_spec()
+    if stack_spec:
+        st.caption(f"Stack: `{', '.join(stack_spec.detected_languages)}` (`{stack_spec.image_tag}`)")
+
+    if not os.getenv("GITHUB_TOKEN"):
+        st.caption("⚠️ No `GITHUB_TOKEN`: GitHub calls are limited to 60/hour.")
+
+# ───────────────────────────── Run / load ─────────────────────────────
 state = None
-is_last_run = False
+is_cached = False
 
 if run_btn:
-    if not MAP_PATH.exists():
-        st.error(f"`{MAP_PATH}` not found. Run `kensho index` in your terminal first.")
+    problems = preflight()
+    if problems:
+        for p in problems:
+            st.error(p)
     else:
-        state = run_agent()
+        state = run_agent(repo_name, item_type, int(item_number), int(max_retries))
+        if state:
+            st.session_state["state"] = state
+elif "state" in st.session_state:
+    state = st.session_state["state"]
 elif LAST_RUN_PATH.exists():
     try:
         state = json.loads(LAST_RUN_PATH.read_text(encoding="utf-8"))
-        is_last_run = True
+        is_cached = True
     except json.JSONDecodeError:
-        st.warning("`last_run.json` is corrupted. Run the agent again.")
+        st.warning("`last_run.json` is corrupted. Run a new triage.")
 
-# ---------- Results ----------
-if not state or "verdict" not in state:
-    st.info("Pick an issue or PR in the sidebar and click **Run triage & repro**, or run `kensho issue <number>` in your terminal.")
+# ───────────────────────────── Results ─────────────────────────────
+if not state:
+    if not run_btn:
+        st.info("Pick an issue or PR in the sidebar and click **Run triage & repro** "
+                "(or run `git kensho issue <num>` in your terminal).")
     st.stop()
 
-verdict = state.get("verdict", {})
-status = verdict.get("status", "UNKNOWN")
-timed_out = state.get("exit_code") == 124
-heading = f"#{state.get('item_number', '?')}: {state.get('title', '')}"
+verdict = state.get("verdict") or {}
+label, kind, explanation = classify(state)
 
-if is_last_run:
-    st.caption("Showing your last saved run.")
+if is_cached:
+    saved = state.get("saved_at", "an earlier run")
+    st.caption(f"Showing last run ({saved}). Click **Run triage & repro** for a fresh one.")
 
-if status == "VERIFIED":
-    st.success(f"**Verified reproduction** — {heading}")
-elif status == "NOT_REPRODUCED":
-    st.warning(f"**Not reproduced** — {heading}")
-elif timed_out:
-    st.error(f"**Sandbox timed out** — {heading}")
-else:
-    st.error(f"**Test / environment error** — {heading}")
+show_banner(kind, f"**{label}** — #{state.get('item_number', '?')}: {state.get('title', '(untitled)')}  \n{explanation}")
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Status", status.replace("_", " ").title())
-m2.metric("Runtime", str(state.get("target_language", "—")).title())
+m1.metric("Status", label)
+m2.metric("Runtime", str(state.get("target_language", "—")).capitalize())
 m3.metric("Attempts", state.get("retry_count", "—"))
-m4.metric("Duration", f"{state.get('duration_sec', 0)}s")
+m4.metric("Sandbox time", f"{state.get('duration_sec', 0)}s")
 
-if verdict.get("root_cause_summary") or verdict.get("suggested_fix_direction"):
-    with st.container(border=True):
-        if verdict.get("root_cause_summary"):
-            st.markdown(f"**Root cause** — {verdict['root_cause_summary']}")
-        if verdict.get("suggested_fix_direction"):
-            st.markdown(f"**Fix direction** — {verdict['suggested_fix_direction']}")
-
-tab_triage, tab_test, tab_sandbox, tab_report = st.tabs(
-    ["Triage", "Reproduction test", "Sandbox output", "GitHub comment"]
-)
+tab_triage, tab_test, tab_sandbox, tab_report = st.tabs(["🧭 Triage", "🧪 Test", "🐳 Sandbox", "📝 Report"])
 
 with tab_triage:
-    st.markdown(f"**Subdirectory:** `{state.get('target_subdir', '')}`")
-    suspects = state.get("suspect_files", [])
+    st.markdown(f"**Target:** `{state.get('target_language', '—')}` in `{state.get('target_subdir', '—')}`")
     st.markdown("**Suspect files**")
-    for f in suspects:
+    for f in state.get("suspect_files", []) or []:
         st.markdown(f"- `{f}`")
-    if not suspects:
-        st.caption("None identified.")
+    if state.get("search_keywords"):
+        st.markdown("**Search keywords:** " + ", ".join(f"`{k}`" for k in state["search_keywords"]))
     st.markdown("**Hypothesis**")
-    st.info(state.get("hypothesis", "") or "—")
+    st.info(state.get("hypothesis", "") or "(none)")
+    if state.get("models_used"):
+        st.caption("Models used: " + ", ".join(f"{k}: `{v}`" for k, v in state["models_used"].items()))
 
 with tab_test:
-    st.code(state.get("test_code", "") or "(no test generated)", language=state.get("target_language", "python"), line_numbers=True)
+    st.caption("Generated reproduction test")
+    st.code(state.get("test_code", "") or "(none)", language=state.get("target_language", "python"), line_numbers=True)
 
 with tab_sandbox:
-    st.caption(f"Exit code: {state.get('exit_code')}")
+    code = state.get("exit_code")
+    if is_timeout(state):
+        st.warning("Exit code 124: the sandbox timed out. This is not a reproduction.")
+    elif code == 0:
+        st.success("Exit code 0: the test passed.")
+    else:
+        st.markdown(f"**Exit code:** `{code}`")
     with st.expander("STDOUT", expanded=True):
         st.code(state.get("stdout", "") or "(empty)", language="text")
     with st.expander("STDERR", expanded=bool(state.get("stderr"))):
         st.code(state.get("stderr", "") or "(empty)", language="text")
 
 with tab_report:
+    if verdict.get("root_cause_summary"):
+        st.markdown("**Root cause**")
+        st.write(verdict["root_cause_summary"])
+    if verdict.get("suggested_fix_direction"):
+        st.markdown("**Suggested fix direction**")
+        st.write(verdict["suggested_fix_direction"])
+    st.divider()
     report = verdict.get("github_markdown_report", "")
-    st.caption("Use the copy icon in the top-right of the block to copy the Markdown.")
-    st.code(report or "(no report)", language="markdown")
-    with st.expander("Preview"):
-        st.markdown(report)
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Markdown** (use the copy icon, top right of the box)")
+        st.code(report or "(empty)", language="markdown")
+    with right:
+        st.markdown("**Preview**")
+        with st.container(border=True):
+            st.markdown(report or "_(empty)_")
