@@ -14,13 +14,12 @@ load_dotenv(BASE_DIR / ".env")
 
 litellm.drop_params = True
 litellm.suppress_debug_info = True
-litellm.num_retries = 0  # Fail immediately on 429 rate limits instead of sleeping 60s
+litellm.num_retries = 0  # Fail immediately on 429 rate limits to trigger instant Zen failover
 
 T = TypeVar("T", bound=BaseModel)
 
 ZEN_API_BASE = "https://opencode.ai/zen/v1"
 
-# Ordered fastest & highest-reasoning free models first (Gemini -> OpenCode Zen free tier)
 MODEL_CHAIN: list[tuple[str, dict]] = [
     ("gemini/gemini-2.5-flash", {}),
     ("gemini/gemini-2.5-flash-lite", {}),
@@ -49,16 +48,24 @@ def call_structured_llm(
     response_schema: Type[T],
     timeout_sec: int = 20,
 ) -> T:
-    """Fast-failover structured LLM router across Gemini and OpenCode Zen free models."""
     global _LAST_MODEL
     last_error = None
 
+    # Ensure at least one key provider is present
+    has_gemini = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+    has_zen = bool(os.getenv("OPENCODE_ZEN_API_KEY"))
+
+    if not has_gemini and not has_zen:
+        raise RuntimeError("Missing API keys. Run `git kensho config` to configure your API keys.")
+
     for model_name, cfg in MODEL_CHAIN:
         extra_kwargs = {}
+        if model_name.startswith("gemini/") and not has_gemini:
+            continue
         if "api_base" in cfg:
             zen_key = os.getenv(cfg["api_key_env"], "").strip()
             if not zen_key:
-                continue  # Skip Zen models cleanly if OPENCODE_ZEN_API_KEY is not configured
+                continue
             extra_kwargs["api_base"] = cfg["api_base"]
             extra_kwargs["api_key"] = zen_key
 
@@ -77,7 +84,7 @@ def call_structured_llm(
             )
             raw_content = response.choices[0].message.content
             parsed = response_schema.model_validate_json(raw_content)
-            _LAST_MODEL = model_name.replace("openai/", "zen/")
+            _LAST_MODEL = model_name
             return parsed
         except Exception as exc:
             last_error = exc

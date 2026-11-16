@@ -45,9 +45,10 @@ def _fail(exc: Exception) -> None:
 
 @app.command()
 def init(
-    rebuild_image: bool = typer.Option(False, "--rebuild-image", help="Force rebuild of the cached repo Docker image"),
+    rebuild_image: bool = typer.Option(False, "--rebuild-image", help="Force rebuild of cached repo Docker image"),
 ):
-    """Detects fork/upstream remotes, indexes repo architecture, and provisions a cached Docker sandbox."""
+    """Detects fork/upstream remotes, indexes architecture, and provisions cached Docker sandbox."""
+    _ensure_api_keys()
     ctx = detect_repo_context()
     fork_badge = f"fork [cyan]{ctx.origin_repo}[/cyan] -> upstream [green]{ctx.upstream_repo}[/green]" if ctx.is_fork else f"[green]{ctx.upstream_repo}[/green]"
     console.print(Panel(
@@ -137,6 +138,32 @@ def _launch_ui(repo: str, number: int, item_type: str, repo_dir: Path, map_path:
     except KeyboardInterrupt:
         console.print("\n[dim]UI stopped.[/dim]")
 
+@app.command()
+def config(
+    gemini_key: str = typer.Option(..., prompt="Enter your GEMINI_API_KEY", hide_input=True),
+    zen_key: str = typer.Option("", prompt="Enter your OpenCode Zen API Key (optional, press Enter to skip)", hide_input=True),
+    github_token: str = typer.Option("", prompt="Enter your GitHub Token (optional, press Enter to skip)", hide_input=True),
+):
+    """Saves your API keys globally to ~/.kensho/.env."""
+    kensho_home = Path.home() / ".kensho"
+    kensho_home.mkdir(parents=True, exist_ok=True)
+    env_path = kensho_home / ".env"
+
+    lines = [
+        f"GEMINI_API_KEY={gemini_key.strip()}",
+        f"OPENCODE_ZEN_API_KEY={zen_key.strip()}",
+        f"GITHUB_TOKEN={github_token.strip()}",
+    ]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    console.print(f"[bold green]✓ Configuration saved successfully to {env_path}[/bold green]")
+
+
+def _ensure_api_keys() -> None:
+    """Pre-flight check: prompts or errors if GEMINI_API_KEY is missing."""
+    if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("OPENCODE_ZEN_API_KEY")):
+        console.print("[bold red]❌ No API keys detected![/bold red]")
+        console.print("Please run [cyan]git kensho config[/cyan] first to set up your keys.")
+        raise typer.Exit(code=1)
 
 def _run(repo: str, number: int, item_type: str, repo_dir: Path, map_path: Path, max_retries: int, cli: bool):
     if cli:
