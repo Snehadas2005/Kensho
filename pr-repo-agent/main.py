@@ -44,6 +44,25 @@ def _fail(exc: Exception) -> None:
     raise typer.Exit(code=1)
 
 @app.command()
+def config(
+    gemini_key: str = typer.Option(..., prompt="Enter your GEMINI_API_KEY", hide_input=True),
+    zen_key: str = typer.Option("", prompt="Enter your OpenCode Zen API Key (optional, press Enter to skip)", hide_input=True),
+    github_token: str = typer.Option("", prompt="Enter your GitHub Token (optional, press Enter to skip)", hide_input=True),
+):
+    """Saves your API keys globally to ~/.kensho/.env."""
+    kensho_home = Path.home() / ".kensho"
+    kensho_home.mkdir(parents=True, exist_ok=True)
+    env_path = kensho_home / ".env"
+
+    lines = [
+        f"GEMINI_API_KEY={gemini_key.strip()}",
+        f"OPENCODE_ZEN_API_KEY={zen_key.strip()}",
+        f"GITHUB_TOKEN={github_token.strip()}",
+    ]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    console.print(f"[bold green]✓ Configuration saved successfully to {env_path}[/bold green]")
+
+@app.command()
 def init(
     rebuild_image: bool = typer.Option(False, "--rebuild-image", help="Force rebuild of cached repo Docker image"),
 ):
@@ -137,25 +156,6 @@ def _launch_ui(repo: str, number: int, item_type: str, repo_dir: Path, map_path:
         )
     except KeyboardInterrupt:
         console.print("\n[dim]UI stopped.[/dim]")
-
-@app.command()
-def config(
-    gemini_key: str = typer.Option(..., prompt="Enter your GEMINI_API_KEY", hide_input=True),
-    zen_key: str = typer.Option("", prompt="Enter your OpenCode Zen API Key (optional, press Enter to skip)", hide_input=True),
-    github_token: str = typer.Option("", prompt="Enter your GitHub Token (optional, press Enter to skip)", hide_input=True),
-):
-    """Saves your API keys globally to ~/.kensho/.env."""
-    kensho_home = Path.home() / ".kensho"
-    kensho_home.mkdir(parents=True, exist_ok=True)
-    env_path = kensho_home / ".env"
-
-    lines = [
-        f"GEMINI_API_KEY={gemini_key.strip()}",
-        f"OPENCODE_ZEN_API_KEY={zen_key.strip()}",
-        f"GITHUB_TOKEN={github_token.strip()}",
-    ]
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    console.print(f"[bold green]✓ Configuration saved successfully to {env_path}[/bold green]")
 
 
 def _ensure_api_keys() -> None:
