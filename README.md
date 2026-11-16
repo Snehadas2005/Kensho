@@ -35,7 +35,7 @@ Unlike static PR bots that only summarize text diffs—or heavy autonomous coder
 [1. Repo Onboarding & Sync]
    └── Reads docs + directory tree ──► builds `repo_map.json` (syncs incrementally via git SHA)
 
-[2. Daily CLI / Streamlit Trigger]: `python main.py issue <number>` or `pr <number>`
+[2. Daily Trigger]: `kensho issue <number>` or `pr <number>` (opens the UI; `--cli` for terminal output)
        │
        ▼
 ┌──────────────────────────────────────────────────────────┐
@@ -75,7 +75,8 @@ Unlike static PR bots that only summarize text diffs—or heavy autonomous coder
 
 ```text
 pr-repo-agent/
-├── main.py                  # Typer + Rich CLI (`index`, `sync`, `issue`, `pr`)
+├── main.py                  # Typer + Rich CLI (`index`, `sync`, `issue`, `pr`; `--cli` for terminal-only)
+├── pyproject.toml           # Installs the `kensho` / `git kensho` commands
 ├── app.py                   # Streamlit UI for inspecting traces, logs & Markdown reports
 ├── requirements.txt         # Python dependencies
 ├── .env.example             # Template for API keys
@@ -115,7 +116,7 @@ cd Kensho/pr-repo-agent
 
 python -m venv .venv
 source .venv/bin/activate  # On Windows Git Bash: source .venv/Scripts/activate
-pip install -r requirements.txt
+pip install -e .          # installs the `kensho` and `git kensho` commands + dependencies
 
 ```
 
@@ -145,25 +146,31 @@ docker build -t repro-go:latest -f docker/Dockerfile.go .
 
 ```bash
 # 1. Build initial Repo Architecture Map (one-time)
-python main.py index --repo kubeflow/pipelines
+kensho index --repo kubeflow/pipelines
 
 # 2. Pull the latest commits and incrementally update the map
-python main.py sync
+kensho sync
 
-# 3. Triage & reproduce a GitHub Issue
-python main.py issue 13401
+# 3. Triage & reproduce a GitHub Issue -> opens the Streamlit UI and runs it automatically
+kensho issue 13401
 
-# 4. Triage & verify a GitHub Pull Request
-python main.py pr 1333
+# 4. Same, but terminal-only output (no browser)
+kensho issue 13401 --cli
 
-# 5. Launch the visual trace & report viewer
+# 5. Triage & verify a Pull Request (UI by default, --cli for terminal)
+kensho pr 1333
+kensho pr 1333 --cli
+
+# 6. Open the UI on its own (shows your last run, or pick a target in the sidebar)
 streamlit run app.py
 
-# 6. Run the unit tests
+# 7. Run the unit tests
 pytest
 ```
 
-> Run all commands from inside `pr-repo-agent/`, since `workspace/` and `.streamlit/` are resolved relative to it.
+`git kensho issue 13401` works too: the install also provides a `git-kensho` command, and git treats any `git-<name>` executable on your `PATH` as a subcommand (activate your virtual environment first). You can also run everything without installing via `python main.py <command>`.
+
+> `kensho` can be run from any directory. The Docker builds and `streamlit run app.py` must be run from inside `pr-repo-agent/`.
 
 ---
 

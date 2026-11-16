@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kensho-agent"
+version = "2.0.0"
+description = "Fork-aware autonomous PR triage and sandboxed bug reproduction CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "litellm>=1.50.0",
+    "langgraph>=0.2.0",
+    "pydantic>=2.7.0",
+    "docker>=7.0.0",
+    "PyGithub>=2.3.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "streamlit>=1.38.0",
+    "python-dotenv>=1.0.0",
+    "chromadb>=0.5.0",
+]
+
+[project.scripts]
+kensho = "main:app"
+git-kensho = "main:app"
+
+[tool.setuptools]
+package-dir = {"" = "pr-repo-agent"}
+py-modules = ["main", "app", "ui_theme"]
+packages = ["core","memory"]

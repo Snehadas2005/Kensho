@@ -17,7 +17,10 @@ from core.stack_detector import StackSpec, detect_stack, ensure_sandbox_image
 from core.graph import build_triage_graph
 
 
-app = typer.Typer(help=f"Kensho (v{__version__}) — Autonomous PR Triage & Bug Reproduction Agent")
+app = typer.Typer(
+    help="Kensho (v2) — Fork-Aware Autonomous PR Triage & Sandboxed Bug Reproduction CLI",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 console = Console()
 
 # Resolve paths from this file so the command works from any directory

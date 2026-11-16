@@ -1,67 +1,86 @@
-import logging
-import time
+import os
+from pathlib import Path
 from typing import Type, TypeVar
 from dotenv import load_dotenv
-from pydantic import BaseModel
 import litellm
+from pydantic import BaseModel
 
-load_dotenv()
+# Load global ~/.kensho/.env first, then local repo .env
+GLOBAL_ENV = Path.home() / ".kensho" / ".env"
+BASE_DIR = Path(__file__).resolve().parent.parent
+if GLOBAL_ENV.exists():
+    load_dotenv(GLOBAL_ENV)
+load_dotenv(BASE_DIR / ".env")
+
 litellm.drop_params = True
 litellm.suppress_debug_info = True
-
-logger = logging.getLogger("kensho.llm")
+litellm.num_retries = 0  # Fail immediately on 429 rate limits instead of sleeping 60s
 
 T = TypeVar("T", bound=BaseModel)
 
-# Free-tier Google AI Studio models ordered by reasoning strength -> throughput
-DEFAULT_MODEL_CHAIN = [
-    "gemini/gemini-3.8-flash",
-    "gemini/gemini-3.5-flash-lite",
-    "gemini/gemma-4-26b-a4b-it",
+ZEN_API_BASE = "https://opencode.ai/zen/v1"
+
+# Ordered fastest & highest-reasoning free models first (Gemini -> OpenCode Zen free tier)
+MODEL_CHAIN: list[tuple[str, dict]] = [
+    ("gemini/gemini-2.5-flash", {}),
+    ("gemini/gemini-2.5-flash-lite", {}),
+    ("gemini/gemini-3.8-flash", {}),
+    ("gemini/gemini-3.5-flash-lite", {}),
+    ("gemini/gemma-4-26b-a4b-it", {}),
+    ("openai/deepseek-v4.1-flash-free", {"api_base": ZEN_API_BASE, "api_key_env": "OPENCODE_ZEN_API_KEY"}),
+    ("openai/glm-5.3-flash-free", {"api_base": ZEN_API_BASE, "api_key_env": "OPENCODE_ZEN_API_KEY"}),
+    ("openai/nemotron-3.5-lightning-free", {"api_base": ZEN_API_BASE, "api_key_env": "OPENCODE_ZEN_API_KEY"}),
+    ("openai/mimo-v2.6-flash-free", {"api_base": ZEN_API_BASE, "api_key_env": "OPENCODE_ZEN_API_KEY"}),
+    ("openai/minimax-m3.1-flash-free", {"api_base": ZEN_API_BASE, "api_key_env": "OPENCODE_ZEN_API_KEY"}),
+    ("openai/big-pickle", {"api_base": ZEN_API_BASE, "api_key_env": "OPENCODE_ZEN_API_KEY"}),
+    ("openai/beam-free", {"api_base": ZEN_API_BASE, "api_key_env": "OPENCODE_ZEN_API_KEY"}),
 ]
 
-RATE_LIMIT_RETRIES = 2
+_LAST_MODEL: str = MODEL_CHAIN[0][0]
+
+
+def get_last_model() -> str:
+    return _LAST_MODEL
 
 
 def call_structured_llm(
     system_prompt: str,
     user_prompt: str,
     response_schema: Type[T],
-    models: list[str] | None = None,
-    temperature: float = 0.1,
+    timeout_sec: int = 20,
 ) -> T:
-    """Calls free-tier LLMs with automatic fallback and enforces a Pydantic schema."""
-    models = models or DEFAULT_MODEL_CHAIN
-    last_error: Exception | None = None
+    """Fast-failover structured LLM router across Gemini and OpenCode Zen free models."""
+    global _LAST_MODEL
+    last_error = None
 
-    for model_name in models:
-        for attempt in range(RATE_LIMIT_RETRIES + 1):
-            try:
-                response = litellm.completion(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format=response_schema,
-                    temperature=temperature,
-                )
-                raw_content = response.choices[0].message.content
-                result = response_schema.model_validate_json(raw_content)
-                logger.info("LLM call succeeded with %s", model_name)
-                return result
-            except litellm.RateLimitError as e:
-                last_error = e
-                if attempt < RATE_LIMIT_RETRIES:
-                    wait = 2 * (attempt + 1)
-                    logger.warning("%s rate-limited, retrying in %ss", model_name, wait)
-                    time.sleep(wait)
-                    continue
-                logger.warning("%s still rate-limited, falling back", model_name)
-                break
-            except Exception as e:  # noqa: BLE001 - any failure -> try next model
-                last_error = e
-                logger.warning("%s failed (%s: %s), falling back", model_name, type(e).__name__, e)
-                break
+    for model_name, cfg in MODEL_CHAIN:
+        extra_kwargs = {}
+        if "api_base" in cfg:
+            zen_key = os.getenv(cfg["api_key_env"], "").strip()
+            if not zen_key:
+                continue  # Skip Zen models cleanly if OPENCODE_ZEN_API_KEY is not configured
+            extra_kwargs["api_base"] = cfg["api_base"]
+            extra_kwargs["api_key"] = zen_key
 
-    raise RuntimeError(f"All fallback models failed. Last error: {last_error}")
+        try:
+            response = litellm.completion(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format=response_schema,
+                temperature=0.1,
+                timeout=timeout_sec,
+                num_retries=0,
+                **extra_kwargs,
+            )
+            raw_content = response.choices[0].message.content
+            parsed = response_schema.model_validate_json(raw_content)
+            _LAST_MODEL = model_name.replace("openai/", "zen/")
+            return parsed
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    raise RuntimeError(f"All Gemini + OpenCode Zen fallback models failed: {last_error}")
