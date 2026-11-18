@@ -13,10 +13,13 @@ from core.errors import friendly_error
 from core.github_client import fetch_github_item
 from core.graph import build_triage_graph
 
-st.set_page_config(page_title="Kensho", page_icon="🔍", layout="wide", initial_sidebar_state="expanded")
-
-# Theme: follows the native Streamlit toggle (3 dots -> Settings). Default = light (see .streamlit/config.toml)
-st.markdown(ui.build_css(ui.current_mode()), unsafe_allow_html=True)
+_logo_path = Path(__file__).resolve().parent / "assets" / "kensho-logo.png"
+st.set_page_config(
+    page_title="Kensho",
+    page_icon=str(_logo_path) if _logo_path.is_file() else "🔍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE_DIR = ROOT / "workspace"
@@ -143,6 +146,7 @@ if MAP_PATH.exists():
 
 # ---------- Sidebar ----------
 with st.sidebar:
+    mode = ui.theme_toggle("Theme")
     st.markdown(ui.sidebar_title_html("Target"), unsafe_allow_html=True)
     repo_name = st.text_input("GitHub repository", key="repo_name")
     item_type = st.selectbox(
@@ -181,6 +185,7 @@ with st.sidebar:
         rows.append('<div class="k-meta-warn">⚠ GITHUB_TOKEN is not set (rate limits apply)</div>')
     st.markdown(f'<div class="k-meta">{"".join(rows)}</div>', unsafe_allow_html=True)
 
+st.markdown(ui.build_css(mode), unsafe_allow_html=True)
 
 # ---------- Agent ----------
 def run_agent() -> dict | None:
@@ -279,7 +284,7 @@ st.markdown(
     ui.metrics_html(
         [
             ("Status", label),
-            ("Runtime", str(state.get("target_language") or "—")),
+            ("Runtime", str(state.get("target_language") or "—").upper()),
             ("Attempts", str(state.get("retry_count", "—"))),
             ("Sandbox time", duration),
         ]
