@@ -5,6 +5,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.syntax import Syntax
 from rich.markdown import Markdown
 
@@ -16,6 +17,8 @@ from core.git_context import detect_repo_context
 from core.stack_detector import StackSpec, detect_stack, ensure_sandbox_image
 from core.graph import build_triage_graph
 
+from memory.profiler import build_contributor_profile
+from memory.recommender import recommend_issues
 
 app = typer.Typer(
     help="Kensho (v2) — Fork-Aware Autonomous PR Triage & Sandboxed Bug Reproduction CLI",
@@ -230,6 +233,43 @@ def _execute_agent(repo: str, number: int, item_type: str, repo_dir: Path, map_p
     console.print("\n[bold cyan]Ready-to-Post GitHub Markdown Report:[/bold cyan]")
     console.print(Panel(Markdown(verdict.get("github_markdown_report", "")), title="GitHub Comment Draft"))
 
+@app.command()
+def onboard():
+    """Runs a 3-question interactive CLI onboarding interview to build your contributor profile."""
+    ctx = detect_repo_context()
+    profile = build_contributor_profile(ctx, console)
+    console.print(Panel(
+        f"[bold green]Profile saved to {ctx.kensho_dir / 'profile.json'}[/bold green]\n"
+        f"[bold]Focus Areas:[/bold] {', '.join(profile.focus_areas)}\n"
+        f"[bold]Preferred Subdirs:[/bold] {', '.join(profile.favorite_subdirs)}\n"
+        f"[italic]{profile.summary_bio}[/italic]",
+        title=f"Contributor Profile: @{profile.github_username}",
+    ))
+
+@app.command()
+def recommend(
+    top: int = typer.Option(5, "--top", "-t", help="Number of issue recommendations to display"),
+):
+    """Ranks open upstream issues matched to your contributor profile and repo map."""
+    ctx = detect_repo_context()
+    with console.status("[bold cyan]Analyzing open issues & matching against your profile...[/bold cyan]"):
+        recs = recommend_issues(ctx, console, top_n=top)
+
+    if not recs:
+        return
+
+    table = Table(title=f"Top Issue Recommendations for {ctx.upstream_repo}", show_header=True, header_style="bold magenta")
+    table.add_column("Fit", justify="center", style="cyan")
+    table.add_column("#", justify="right", style="yellow")
+    table.add_column("Issue Title", style="white")
+    table.add_column("Module", style="green")
+    table.add_column("Reasoning", style="dim")
+
+    for r in sorted(recs, key=lambda x: x.fit_score, reverse=True):
+        table.add_row(f"{r.fit_score}%", str(r.issue_number), r.title[:55], r.matched_module, r.reasoning[:70])
+
+    console.print(table)
+    console.print("\n[dim]To reproduce any recommended issue, run:[/dim] [cyan]git kensho issue <number>[/cyan]")
 
 @app.command()
 def issue(

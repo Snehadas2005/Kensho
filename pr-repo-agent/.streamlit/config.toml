@@ -1,13 +1,5 @@
 [theme]
-base = "dark"
-primaryColor = "#7C83FD"
-backgroundColor = "#0E1117"
-secondaryBackgroundColor = "#161B26"
-textColor = "#E6E9F0"
-font = "sans serif"
-
-[client]
-toolbarMode = "minimal"
-
-[browser]
-gatherUsageStats = false
+# Light is the default; users can still switch from the 3-dots menu -> Settings.
+base = "light"
+# Colours the slider track / focus rings (the rest is handled in ui_theme.py)
+primaryColor = "#4186EC"

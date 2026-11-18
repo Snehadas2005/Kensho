@@ -1,109 +1,199 @@
 import json
 import os
-import time
-from datetime import datetime
+import re
+import subprocess
+import urllib.request
 from pathlib import Path
 
 import streamlit as st
 
-from core import VERSION
-from core.git_context import detect_repo_context
+import ui_theme as ui
+from core import __version__
+from core.errors import friendly_error
 from core.github_client import fetch_github_item
 from core.graph import build_triage_graph
-from core.guards import is_sandbox_error, is_timeout
-from core.stack_detector import StackSpec
-from ui_theme import brand_header_html, build_css, find_logo
 
-_logo = find_logo()
-st.set_page_config(
-    page_title="Kensho",
-    page_icon=str(_logo) if _logo else "🔍",
-    layout="wide",
-)
+st.set_page_config(page_title="Kensho", page_icon="🔍", layout="wide", initial_sidebar_state="expanded")
 
-# Resolve active Git repository context dynamically; fall back to current repo if outside a git tree
-try:
-    CTX = detect_repo_context()
-    REPO_DIR = CTX.repo_root
-    MAP_PATH = CTX.map_path
-    STACK_PATH = CTX.stack_path
-    LAST_RUN_PATH = CTX.last_run_path
-    DEFAULT_UPSTREAM = CTX.upstream_repo
-except RuntimeError:
-    CTX = None
-    REPO_DIR = Path.cwd().resolve()
-    _fallback_dir = REPO_DIR / ".kensho"
-    MAP_PATH = _fallback_dir / "repo_map.json"
-    STACK_PATH = _fallback_dir / "stack_spec.json"
-    LAST_RUN_PATH = _fallback_dir / "last_run.json"
-    DEFAULT_UPSTREAM = "Snehadas2005/Kensho"
+# Theme: follows the native Streamlit toggle (3 dots -> Settings). Default = light (see .streamlit/config.toml)
+st.markdown(ui.build_css(ui.current_mode()), unsafe_allow_html=True)
 
-STEP_LABELS = {
+ROOT = Path(__file__).resolve().parent
+WORKSPACE_DIR = ROOT / "workspace"
+LAST_RUN_PATH = WORKSPACE_DIR / "last_run.json"
+PENDING_RUN_PATH = WORKSPACE_DIR / "pending_run.json"
+ALT_MAP_PATH = ROOT / ".kensho" / "repo_map.json"  # used when workspace/repo_map.json does not exist
+
+NODE_LABELS = {
     "triage": "Triage & localization",
     "explorer_coder": "Writing reproduction test",
     "sandbox": "Running in Docker sandbox",
     "judge": "Judging result",
 }
 
-st.markdown(build_css(st.session_state.get("light_mode", False)), unsafe_allow_html=True)
+
+# ---------- small helpers ----------
+def _git(*args: str, cwd: str | None = None) -> str:
+    try:
+        out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
-def _load_stack_spec() -> StackSpec | None:
-    if STACK_PATH.exists():
+def _slug(url: str) -> str:
+    m = re.search(r"github\.com[:/]+([^/\s]+/[^/\s]+?)(?:\.git)?/?$", url or "")
+    return m.group(1) if m else ""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def detect_repo_context(repo_dir: str) -> dict:
+    """Fork / upstream relationship read from the git remotes of the target clone."""
+    if not Path(repo_dir).is_dir():
+        return {}
+    return {
+        "origin": _slug(_git("remote", "get-url", "origin", cwd=repo_dir)),
+        "upstream": _slug(_git("remote", "get-url", "upstream", cwd=repo_dir)),
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def github_username(token: str, fallback: str) -> str:
+    """Authenticated GitHub login (needs GITHUB_TOKEN), else git config / remote owner."""
+    if token:
         try:
-            return StackSpec.model_validate_json(STACK_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-    return None
+            req = urllib.request.Request(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                login = json.loads(resp.read().decode()).get("login")
+                if login:
+                    return login
+        except Exception:  # noqa: BLE001
+            pass
+    return fallback or _git("config", "user.name")
 
 
-def classify(state: dict) -> tuple[str, str, str]:
-    """Returns (label, banner_kind, explanation). Timeouts and Docker errors get their own states."""
-    status = (state.get("verdict") or {}).get("status", "UNKNOWN")
-    if is_timeout(state):
-        return "TIMEOUT", "warning", "The sandbox timed out before the test finished. Nothing was verified."
-    if is_sandbox_error(state):
-        return "SANDBOX ERROR", "error", "The Docker sandbox failed to run. Check Docker and the cached sandbox image."
-    if status == "VERIFIED":
-        return "VERIFIED", "success", "The generated test failed in the way the report describes."
-    if status == "NOT_REPRODUCED":
-        return "NOT REPRODUCED", "warning", "The generated test passed, so the bug was not triggered."
-    if status == "TEST_ERROR":
-        return "TEST ERROR", "error", "The generated test itself was broken (syntax, imports or setup)."
-    return "UNKNOWN", "info", "No verdict available."
+def pick(source: dict, *keys, default=None):
+    """First non-empty value among several possible state keys."""
+    for k in keys:
+        v = source.get(k)
+        if v not in (None, "", [], {}):
+            return v
+    return default
 
 
-def show_banner(kind: str, text: str) -> None:
-    {"success": st.success, "warning": st.warning, "error": st.error}.get(kind, st.info)(text)
+def excerpt(text: str, limit: int = 260) -> str:
+    t = re.sub(r"```.*?```", " ", text or "", flags=re.S)
+    t = re.sub(r"[#>*`_\[\]]", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:limit].rstrip() + "…" if len(t) > limit else t
 
 
-def preflight() -> list[str]:
-    problems = []
-    if not MAP_PATH.exists():
-        problems.append("`.kensho/repo_map.json` not found. Run `git kensho init` in your terminal first.")
-    if not REPO_DIR.exists():
-        problems.append(f"Repository path `{REPO_DIR}` not found.")
-    if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
-        problems.append("`GEMINI_API_KEY` is not set. Add it to your `.env` file.")
-    return problems
+def as_list(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [v.strip() for v in re.split(r"[,\n]", value) if v.strip()]
+    return [str(v) for v in value]
 
 
-def run_agent(repo_name: str, item_type: str, item_number: int, max_retries: int) -> dict | None:
-    """Runs the graph, streaming each node's completion into a live status box."""
-    started = time.perf_counter()
-    state: dict = {}
+def runtime_stack(repo_map: dict) -> str:
+    stack = pick(repo_map, "runtimes", "runtime_stack", "languages", "stack")
+    if isinstance(stack, dict):
+        stack = list(stack.keys())
+    if not stack:
+        stack = {m.get("language") for m in repo_map.get("modules", []) if isinstance(m, dict) and m.get("language")}
+    return ", ".join(sorted(as_list(list(stack) if not isinstance(stack, (str, list)) else stack)))
 
-    with st.status(f"Fetching {item_type.upper()} #{item_number}…", expanded=True) as status:
+
+# ---------- state defaults ----------
+_boot_ctx = detect_repo_context(str(WORKSPACE_DIR / "notebooks"))
+st.session_state.setdefault("repo_name", _boot_ctx.get("upstream") or "kubeflow/notebooks")
+st.session_state.setdefault("item_type", "issue")
+st.session_state.setdefault("item_number", 1596)
+st.session_state.setdefault("max_retries", 2)
+st.session_state.setdefault("repo_dir", str(WORKSPACE_DIR / st.session_state["repo_name"].split("/")[-1]))
+st.session_state.setdefault("map_path", str(WORKSPACE_DIR / "repo_map.json"))
+
+# a pending request written by `kensho issue <n>` overrides the defaults once per session
+if "pending_checked" not in st.session_state:
+    st.session_state["pending_checked"] = True
+    if PENDING_RUN_PATH.exists():
         try:
-            work_item = fetch_github_item(repo_name, item_number, item_type=item_type)
-            st.write(f"📥 Fetched: **{work_item.title}**")
+            st.session_state.update(json.loads(PENDING_RUN_PATH.read_text(encoding="utf-8")))
+            st.session_state["autorun"] = True
+        except (json.JSONDecodeError, OSError):
+            pass
+        finally:
+            PENDING_RUN_PATH.unlink(missing_ok=True)
 
-            stack_spec = _load_stack_spec()
-            graph = build_triage_graph(REPO_DIR, stack_spec=stack_spec)
+REPO_DIR = Path(st.session_state["repo_dir"])
+MAP_PATH = Path(st.session_state["map_path"])
+if not MAP_PATH.exists() and ALT_MAP_PATH.exists():
+    MAP_PATH = ALT_MAP_PATH
+
+repo_map: dict = {}
+if MAP_PATH.exists():
+    try:
+        repo_map = json.loads(MAP_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        repo_map = {}
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.markdown(ui.sidebar_title_html("Target"), unsafe_allow_html=True)
+    repo_name = st.text_input("GitHub repository", key="repo_name")
+    item_type = st.selectbox(
+        "Item Type", ["issue", "pr"], key="item_type", format_func=lambda v: {"issue": "Issue", "pr": "PR"}[v]
+    )
+    item_number = st.number_input("Issue / PR Number", min_value=1, step=1, key="item_number")
+    max_retries = st.slider("Maximum self-correction retries", 0, 3, key="max_retries")
+    run_btn = st.button("Run Triage & Repro", type="primary", use_container_width=True)
+    run_btn = run_btn or st.session_state.pop("autorun", False)
+
+    # compact info block: user, fork/upstream, repo map, runtime stack, sandbox image
+    ctx = detect_repo_context(str(REPO_DIR))
+    token = os.environ.get("GITHUB_TOKEN", "")
+    owner_fallback = (ctx.get("origin") or "").split("/")[0]
+    user = github_username(token, owner_fallback)
+
+    def row(label: str, value: str) -> str:
+        return f'<div class="k-meta-row"><span>{ui.esc(label)}</span><b>{ui.esc(value)}</b></div>'
+
+    rows = [row("GitHub user", f"@{user}" if user else "unknown")]
+    if ctx.get("upstream") and ctx.get("origin"):
+        rows.append(row("Fork → Upstream", f"{ctx['origin']} → {ctx['upstream']}"))
+    elif ctx.get("origin"):
+        rows.append(row("Remote", ctx["origin"]))
+    if repo_map:
+        sha = str(repo_map.get("last_indexed_sha", ""))[:7] or "—"
+        rows.append(row("Repo map", f"{sha} · {len(repo_map.get('modules', []))} modules"))
+        stack = runtime_stack(repo_map)
+        if stack:
+            rows.append(row("Runtime stack", stack))
+    elif MAP_PATH.exists():
+        rows.append('<div class="k-meta-warn">repo_map.json unreadable. Re-run <code>kensho index</code>.</div>')
+    image = "kensho-sandbox-" + re.sub(r"[^a-z0-9]+", "-", repo_name.lower()).strip("-") + ":latest"
+    rows.append(row("Sandbox image", image))
+    if not token:
+        rows.append('<div class="k-meta-warn">⚠ GITHUB_TOKEN is not set (rate limits apply)</div>')
+    st.markdown(f'<div class="k-meta">{"".join(rows)}</div>', unsafe_allow_html=True)
+
+
+# ---------- Agent ----------
+def run_agent() -> dict | None:
+    """Runs the graph, streaming node progress into the UI. Returns final state or None on failure."""
+    try:
+        with st.status("Running agent loop…", expanded=True) as status:
+            st.write("Fetching item from GitHub…")
+            work_item = fetch_github_item(repo_name, int(item_number), item_type=item_type)
+            graph = build_triage_graph(REPO_DIR)
             initial = {
                 "repo_name": repo_name,
                 "item_type": item_type,
-                "item_number": item_number,
+                "item_number": int(item_number),
                 "title": work_item.title,
                 "body": work_item.body,
                 "diff_summary": work_item.diff_summary,
@@ -111,146 +201,143 @@ def run_agent(repo_name: str, item_type: str, item_number: int, max_retries: int
                 "retry_count": 0,
                 "max_retries": max_retries,
             }
-            state = dict(initial)
+            final = dict(initial)
+            for update in graph.stream(initial, stream_mode="updates"):
+                for node, delta in update.items():
+                    final.update(delta or {})
+                    label = NODE_LABELS.get(node, node)
+                    extra = ""
+                    if node == "sandbox":
+                        extra = f" (exit code {final.get('exit_code')}, attempt {final.get('retry_count')})"
+                    st.write(f"✓ {label}{extra}")
+            status.update(label="Agent loop finished", state="complete", expanded=False)
+    except Exception as exc:  # noqa: BLE001
+        st.error(friendly_error(exc))
+        return None
 
-            for chunk in graph.stream(initial, stream_mode="updates"):
-                for node, update in chunk.items():
-                    state.update(update)
-                    status.update(label=f"{STEP_LABELS.get(node, node)} ✓", state="running")
-                    if node == "triage":
-                        st.write(f"🧭 Triage → `{state.get('target_language')}` in `{state.get('target_subdir')}`")
-                    elif node == "explorer_coder":
-                        st.write(f"🧪 Test drafted (attempt {state.get('retry_count', 0) + 1})")
-                    elif node == "sandbox":
-                        st.write(f"🐳 Sandbox finished: exit code `{state.get('exit_code')}` in {state.get('duration_sec')}s")
-                    elif node == "judge":
-                        st.write(f"⚖️ Verdict: **{(state.get('verdict') or {}).get('status', 'UNKNOWN')}**")
-
-            state["total_duration_sec"] = round(time.perf_counter() - started, 1)
-            state["saved_at"] = datetime.now().isoformat(timespec="seconds")
-            LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
-            LAST_RUN_PATH.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
-            status.update(label="Done", state="complete", expanded=False)
-            return state
-
-        except Exception as e:  # noqa: BLE001
-            status.update(label="Run failed", state="error", expanded=True)
-            name = type(e).__name__
-            if name == "DockerException" or ("docker" in str(e).lower() and "connect" in str(e).lower()):
-                st.error("Docker isn't reachable. Start Docker Desktop and try again.")
-            elif name == "GithubException":
-                st.error(f"GitHub API error: {getattr(e, 'data', e)}. Check the repo name, item number and `GITHUB_TOKEN`.")
-            elif name == "RuntimeError" and "fallback models failed" in str(e):
-                st.error("All LLM models failed (likely rate limits on the free tier). Wait a minute and retry.")
-                st.code(str(e), language="text")
-            else:
-                st.error(f"{name}: {e}")
-            with st.expander("Technical details"):
-                st.exception(e)
-            return None
+    LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_RUN_PATH.write_text(json.dumps(final, indent=2, default=str), encoding="utf-8")
+    return final
 
 
-# ───────────────────────────── Header ─────────────────────────────
-st.markdown(brand_header_html(VERSION), unsafe_allow_html=True)
+# ---------- Masthead ----------
+st.markdown(ui.masthead_html(__version__), unsafe_allow_html=True)
 
-# ───────────────────────────── Sidebar ─────────────────────────────
-with st.sidebar:
-    st.toggle("☀️ Light mode", key="light_mode")
-    st.divider()
-    st.header("Target")
-    if CTX and CTX.is_fork:
-        st.caption(f"Fork: `{CTX.origin_repo}` → Upstream: `{CTX.upstream_repo}`")
-    repo_name = st.text_input("GitHub repository", value=DEFAULT_UPSTREAM)
-    item_type = st.selectbox("Item type", ["issue", "pr"])
-    item_number = st.number_input("Issue / PR number", min_value=1, value=1, step=1)
-    max_retries = st.slider("Max self-correction retries", 0, 3, 2)
-    run_btn = st.button("Run triage & repro", type="primary", use_container_width=True)
-
-    st.divider()
-    if MAP_PATH.exists():
-        repo_map = json.loads(MAP_PATH.read_text(encoding="utf-8"))
-        st.caption(f"Indexed SHA: `{repo_map.get('last_indexed_sha', '')[:7]}`")
-        st.caption(f"Indexed modules: {len(repo_map.get('modules', []))}")
-    else:
-        st.caption("Repo not indexed yet. Run `git kensho init`.")
-
-    stack_spec = _load_stack_spec()
-    if stack_spec:
-        st.caption(f"Stack: `{', '.join(stack_spec.detected_languages)}` (`{stack_spec.image_tag}`)")
-
-    if not os.getenv("GITHUB_TOKEN"):
-        st.caption("⚠️ No `GITHUB_TOKEN`: GitHub calls are limited to 60/hour.")
-
-# ───────────────────────────── Run / load ─────────────────────────────
+# ---------- Load / run ----------
 state = None
-is_cached = False
+is_last_run = False
 
 if run_btn:
-    problems = preflight()
-    if problems:
-        for p in problems:
-            st.error(p)
+    if not MAP_PATH.exists():
+        st.error(f"`{MAP_PATH}` not found. Run `kensho index` in your terminal first.")
     else:
-        state = run_agent(repo_name, item_type, int(item_number), int(max_retries))
-        if state:
-            st.session_state["state"] = state
-elif "state" in st.session_state:
-    state = st.session_state["state"]
+        state = run_agent()
 elif LAST_RUN_PATH.exists():
     try:
         state = json.loads(LAST_RUN_PATH.read_text(encoding="utf-8"))
-        is_cached = True
+        is_last_run = True
     except json.JSONDecodeError:
-        st.warning("`last_run.json` is corrupted. Run a new triage.")
+        st.warning("`last_run.json` is corrupted. Run the agent again.")
 
-# ───────────────────────────── Results ─────────────────────────────
-if not state:
-    if not run_btn:
-        st.info("Pick an issue or PR in the sidebar and click **Run triage & repro** "
-                "(or run `git kensho issue <num>` in your terminal).")
+if not state or "verdict" not in state:
+    st.info("Pick an issue or PR in the sidebar and click **Run Triage & Repro**, or run `kensho issue <number>` in your terminal.")
     st.stop()
 
+# ---------- Results: banner + metrics ----------
 verdict = state.get("verdict") or {}
-label, kind, explanation = classify(state)
+raw_status = str(verdict.get("status", "UNKNOWN")).upper()
+exit_code = state.get("exit_code")
 
-if is_cached:
-    saved = state.get("saved_at", "an earlier run")
-    st.caption(f"Showing last run ({saved}). Click **Run triage & repro** for a fresh one.")
+if raw_status == "VERIFIED":
+    kind, label = "ok", "VERIFIED"
+elif raw_status == "NOT_REPRODUCED":
+    kind, label = "warn", "NOT REPRODUCED"
+elif exit_code == 124:
+    kind, label = "err", "TIMEOUT"
+elif "SANDBOX" in raw_status:
+    kind, label = "err", "SANDBOX ERROR"
+elif "ERROR" in raw_status:
+    kind, label = "err", "TEST ERROR"
+else:
+    kind, label = "err", raw_status.replace("_", " ")
 
-show_banner(kind, f"**{label}** — #{state.get('item_number', '?')}: {state.get('title', '(untitled)')}  \n{explanation}")
+if is_last_run:
+    st.markdown(
+        ui.caption_html("Showing your last saved run. Click Run Triage & Repro for a new one"),
+        unsafe_allow_html=True,
+    )
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Status", label)
-m2.metric("Runtime", str(state.get("target_language", "—")).capitalize())
-m3.metric("Attempts", state.get("retry_count", "—"))
-m4.metric("Sandbox time", f"{state.get('duration_sec', 0)}s")
+banner_title = f"{label} - #{state.get('item_number', '?')}: {state.get('title', '')}"
+st.markdown(ui.banner_html(kind, banner_title, excerpt(state.get("body", ""))), unsafe_allow_html=True)
 
-tab_triage, tab_test, tab_sandbox, tab_report = st.tabs(["🧭 Triage", "🧪 Test", "🐳 Sandbox", "📝 Report"])
+try:
+    duration = f"{float(state.get('duration_sec', 0)):.2f}s"
+except (TypeError, ValueError):
+    duration = "—"
+
+st.markdown(
+    ui.metrics_html(
+        [
+            ("Status", label),
+            ("Runtime", str(state.get("target_language") or "—")),
+            ("Attempts", str(state.get("retry_count", "—"))),
+            ("Sandbox time", duration),
+        ]
+    ),
+    unsafe_allow_html=True,
+)
+
+# ---------- Tabs ----------
+tab_triage, tab_test, tab_sandbox, tab_report = st.tabs(["Triage", "Test", "Sandbox", "Report"])
 
 with tab_triage:
-    st.markdown(f"**Target:** `{state.get('target_language', '—')}` in `{state.get('target_subdir', '—')}`")
-    st.markdown("**Suspect files**")
-    for f in state.get("suspect_files", []) or []:
-        st.markdown(f"- `{f}`")
-    if state.get("search_keywords"):
-        st.markdown("**Search keywords:** " + ", ".join(f"`{k}`" for k in state["search_keywords"]))
-    st.markdown("**Hypothesis**")
-    st.info(state.get("hypothesis", "") or "(none)")
-    if state.get("models_used"):
-        st.caption("Models used: " + ", ".join(f"{k}: `{v}`" for k, v in state["models_used"].items()))
+    lang = str(state.get("target_language") or "—").lower()
+    subdir = state.get("target_subdir") or ""
+    target_txt = f"{lang} in {subdir}" if subdir else lang
+    st.markdown(f'<div class="k-line"><b>Target</b>: {ui.esc(target_txt)}</div>', unsafe_allow_html=True)
+
+    suspects = as_list(state.get("suspect_files"))
+    st.markdown('<div class="k-line"><b>Suspected files</b></div>', unsafe_allow_html=True)
+    if suspects:
+        items = "".join(f"<li>{ui.esc(f)}</li>" for f in suspects)
+        st.markdown(f'<ul class="k-list">{items}</ul>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="k-list k-muted">None identified.</div>', unsafe_allow_html=True)
+
+    keywords = as_list(pick(state, "search_keywords", "keywords", "symbols") or pick(verdict, "search_keywords", "keywords"))
+    chips = "".join(f'<span class="k-chip">{ui.esc(k)}</span>' for k in keywords) or '<span class="k-muted">—</span>'
+    st.markdown(f'<div class="k-line"><b>Search Keywords:</b> {chips}</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="k-line"><b>Hypothesis</b></div>', unsafe_allow_html=True)
+    st.markdown(state.get("hypothesis") or "—")
+
+    models = pick(state, "models", "models_used", "model_telemetry")
+    if models:
+        if isinstance(models, dict):
+            txt = " · ".join(f"{k}: {v}" for k, v in models.items())
+        else:
+            txt = ", ".join(as_list(models))
+        st.markdown(f'<div class="k-line"><b>Models</b>: <span class="k-muted">{ui.esc(txt)}</span></div>', unsafe_allow_html=True)
 
 with tab_test:
-    st.caption("Generated reproduction test")
-    st.code(state.get("test_code", "") or "(none)", language=state.get("target_language", "python"), line_numbers=True)
+    st.code(
+        state.get("test_code", "") or "(no test generated)",
+        language=str(state.get("target_language") or "python").lower(),
+        line_numbers=True,
+    )
 
 with tab_sandbox:
-    code = state.get("exit_code")
-    if is_timeout(state):
-        st.warning("Exit code 124: the sandbox timed out. This is not a reproduction.")
-    elif code == 0:
-        st.success("Exit code 0: the test passed.")
+    if exit_code == 0:
+        meaning, pill_cls = "clean exit", ""
+    elif exit_code == 124:
+        meaning, pill_cls = "timed out", "err"
     else:
-        st.markdown(f"**Exit code:** `{code}`")
+        meaning, pill_cls = "non-zero exit", ""
+    st.markdown(
+        f'<div class="k-line"><b>Exit code</b>: <span class="k-pill {pill_cls}">{ui.esc(exit_code)} · {meaning}</span>'
+        f' &nbsp; <b>Sandbox time</b>: {ui.esc(duration)} &nbsp; <b>Attempts</b>: {ui.esc(state.get("retry_count", "—"))}</div>',
+        unsafe_allow_html=True,
+    )
     with st.expander("STDOUT", expanded=True):
         st.code(state.get("stdout", "") or "(empty)", language="text")
     with st.expander("STDERR", expanded=bool(state.get("stderr"))):
@@ -258,18 +345,17 @@ with tab_sandbox:
 
 with tab_report:
     if verdict.get("root_cause_summary"):
-        st.markdown("**Root cause**")
-        st.write(verdict["root_cause_summary"])
+        st.markdown('<div class="k-line"><b>Root cause</b></div>', unsafe_allow_html=True)
+        st.markdown(verdict["root_cause_summary"])
     if verdict.get("suggested_fix_direction"):
-        st.markdown("**Suggested fix direction**")
-        st.write(verdict["suggested_fix_direction"])
-    st.divider()
+        st.markdown('<div class="k-line"><b>Suggested fix direction</b></div>', unsafe_allow_html=True)
+        st.markdown(verdict["suggested_fix_direction"])
+
     report = verdict.get("github_markdown_report", "")
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Markdown** (use the copy icon, top right of the box)")
-        st.code(report or "(empty)", language="markdown")
-    with right:
-        st.markdown("**Preview**")
+    st.markdown('<div class="k-line"><b>GitHub comment</b> <span class="k-muted">(copy icon, top-right of the block)</span></div>', unsafe_allow_html=True)
+    col_raw, col_prev = st.columns(2)
+    with col_raw:
+        st.code(report or "(no report)", language="markdown")
+    with col_prev:
         with st.container(border=True):
-            st.markdown(report or "_(empty)_")
+            st.markdown(report or "_(no report)_")

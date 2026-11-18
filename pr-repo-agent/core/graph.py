@@ -4,6 +4,7 @@ from core.llm import call_structured_llm
 from core.schemas import AgentState, TriageDecision, ReproTestDraft, JudgeVerdict
 from core.tools import read_file_snippet, grep_codebase
 from core.sandbox import PolyglotSandbox
+from memory.vector_store import RepoVectorMemory
 
 
 INFRA_ERROR_MARKER = "Sandbox execution error"
@@ -33,17 +34,37 @@ def deterministic_verdict(exit_code: int, stderr: str) -> JudgeVerdict | None:
     return None
 
 
+def _get_vector_memory(repo_root: Path) -> RepoVectorMemory:
+    kensho_dir = repo_root / ".kensho"
+    return RepoVectorMemory(kensho_dir)
+
+
 def build_triage_graph(repo_dir: Path, stack_spec=None):
     sandbox = PolyglotSandbox(repo_dir=repo_dir, timeout_sec=180, stack_spec=stack_spec)
 
-    def triage_node(state: AgentState) -> dict:
+    def triage_node(state: dict) -> dict:
+        repo_root = Path(state.get("repo_root", repo_dir))
+        title = state.get("title", "")
+        body = state.get("body", "")
+        
+        # RAG Semantic Memory Lookup
+        memory = _get_vector_memory(repo_root)
+        similar_bugs = memory.query_similar(title, body, top_k=2)
+        
+        rag_context = ""
+        if similar_bugs:
+            rag_context = "\n\nSIMILAR PAST BUGS & REPRODUCTIONS (RAG CONTEXT):\n"
+            for sb in similar_bugs:
+                rag_context += f"- [{sb.item_id}] {sb.title} ({sb.status})\n  Root Cause: {sb.root_cause}\n  Test Snippet:\n{sb.test_snippet[:400]}\n\n"
+
         system_prompt = (
             "You are a Senior Maintainer triaging a GitHub issue or PR. "
-            "Use the Repo Architecture Map to determine whether this is primarily a Python or Go issue, "
+            "Use the Repo Architecture Map and any retrieved historical bug context to determine whether this is primarily a Python or Go issue, "
             "pinpoint the exact subdirectory and suspect files, and form a bug-reproduction hypothesis."
         )
         user_prompt = (
             f"REPO ARCHITECTURE MAP:\n{state['repo_map_json']}\n\n"
+            f"{rag_context}"
             f"TYPE: {state['item_type'].upper()} #{state['item_number']}\n"
             f"TITLE: {state['title']}\n\n"
             f"DESCRIPTION:\n{state['body']}\n\n"
@@ -60,7 +81,6 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
         }
 
     def explorer_coder_node(state: AgentState) -> dict:
-        # 1. Gather targeted code context on first attempt
         code_context = state.get("code_context", "")
         if not code_context:
             snippets = []
@@ -124,10 +144,16 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
         }
 
     def judge_node(state: AgentState) -> dict:
-        # Deterministic guardrail: never let the LLM decide timeouts, runtime errors or passing runs
+        repo_root = Path(state.get("repo_root", repo_dir))
+        memory = _get_vector_memory(repo_root)
+
         forced = deterministic_verdict(state["exit_code"], state["stderr"])
         if forced is not None:
-            return {"verdict": forced.model_dump()}
+            verdict_dict = forced.model_dump()
+            state["verdict"] = verdict_dict
+            memory.save_run(state)
+            return {"verdict": verdict_dict}
+
         system_prompt = (
             "You are a Principal Engineer verifying a bug reproduction run inside an isolated Docker sandbox. "
             "Compare the original issue/PR description with the actual pytest/go test output.\n"
@@ -144,7 +170,11 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
             f"STDERR:\n{state['stderr']}"
         )
         verdict = call_structured_llm(system_prompt, user_prompt, JudgeVerdict)
-        return {"verdict": verdict.model_dump()}
+        verdict_dict = verdict.model_dump()
+        state["verdict"] = verdict_dict
+        
+        memory.save_run(state)
+        return {"verdict": verdict_dict}
 
     def route_after_judge(state: AgentState) -> str:
         status = state["verdict"].get("status", "NOT_REPRODUCED")

@@ -1,8 +1,11 @@
 import io
 import re
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
 import docker
+import requests
+import urllib3
 from pydantic import BaseModel
 
 class StackSpec(BaseModel):
@@ -98,8 +101,18 @@ def _render_fast_dockerfile(detected: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def ensure_sandbox_image(repo_root: Path, spec: StackSpec, force_rebuild: bool = False) -> str:
-    client = docker.from_env()
+# The first build downloads base images (python, plus go/node layers) and can sit silent for minutes.
+# This is an *idle* timeout: it resets every time Docker sends a log line.
+BUILD_IDLE_TIMEOUT_SEC = 900
+
+
+def ensure_sandbox_image(
+    repo_root: Path,
+    spec: StackSpec,
+    force_rebuild: bool = False,
+    on_log: Callable[[str], None] | None = None,
+) -> str:
+    client = docker.from_env(timeout=BUILD_IDLE_TIMEOUT_SEC)
     if not force_rebuild:
         try:
             client.images.get(spec.image_tag)
@@ -113,7 +126,22 @@ def ensure_sandbox_image(repo_root: Path, spec: StackSpec, force_rebuild: bool =
         info = tarfile.TarInfo(name="Dockerfile")
         info.size = len(df_bytes)
         tar.addfile(info, io.BytesIO(df_bytes))
-
     buf.seek(0)
-    client.images.build(fileobj=buf, custom_context=True, tag=spec.image_tag, rm=True, timeout=60)
+
+    try:
+        # Low-level API streams build output line by line (images.build() waits on one long request).
+        for event in client.api.build(
+            fileobj=buf, custom_context=True, tag=spec.image_tag, rm=True, decode=True
+        ):
+            if "error" in event:
+                raise RuntimeError(f"Sandbox image build failed: {str(event['error']).strip()}")
+            line = str(event.get("stream", "")).strip()
+            if line and on_log:
+                on_log(line)
+    except (requests.exceptions.ReadTimeout, urllib3.exceptions.ReadTimeoutError) as exc:
+        raise RuntimeError(
+            f"Docker sent no build output for {BUILD_IDLE_TIMEOUT_SEC}s (slow network or stuck pull). "
+            "Check your internet and Docker Desktop, then run `git kensho init` again; "
+            "finished layers are cached so it resumes quickly."
+        ) from exc
     return spec.image_tag

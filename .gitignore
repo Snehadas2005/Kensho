@@ -8,7 +8,7 @@
 workspace
 pr-repo-agent/__pycache__
 pr-repo-agent/core/__pycache__
-./__pycache__
+core/__pycache__
 __pycache__/
 *.pyc
 *.log
