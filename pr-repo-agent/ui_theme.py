@@ -468,6 +468,7 @@ section[data-testid="stSidebar"] {
     background: transparent !important;
     color: var(--side-text) !important;
     border: none !important;
+    display: none !important;
 }
 
 /* Slider value readout: DM Sans 15px, --blue */
@@ -641,26 +642,28 @@ section[data-testid="stSidebar"] {
 
 .k-metrics {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 1rem;
+    grid-template-columns: 1.4fr 1.1fr 0.9fr 1fr;
+    gap: 1.5rem;
     margin: 2rem 0 1.6rem 0;
+    align-items: start;
 }
 .k-m-label {
     font-family: var(--f-result);
     font-size: var(--fs-metric-label);
     letter-spacing: 0.34px;
-    color: var(--text);
+    color: var(--text2);
+    text-transform: uppercase;
 }
 .k-m-value {
     font-family: var(--f-result);
-    font-size: var(--fs-metric-value);
+    font-size: 26px;
+    font-weight: 700;
     letter-spacing: var(--ls-metric);
     color: var(--text);
-    line-height: 1.3;
-    margin-top: 0.4rem;
-    white-space: nowrap;
+    line-height: 1.2;
+    margin-top: 0.3rem;
+    word-break: break-word;
 }
-
 
 /* ==========================================================================
    6. TABS & TAB CONTENT

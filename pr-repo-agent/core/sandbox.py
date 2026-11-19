@@ -1,9 +1,11 @@
 import io
 import os
+import shlex
 import tarfile
 import time
 import uuid
 from pathlib import Path
+
 import docker
 from pydantic import BaseModel
 
@@ -24,6 +26,12 @@ class PolyglotSandbox:
         self.stack_spec = stack_spec
         self._client = None
 
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = docker.from_env()
+        return self._client
+
     def run_repro(
         self,
         language: str,
@@ -31,12 +39,51 @@ class PolyglotSandbox:
         target_subdir: str = "",
     ) -> SandboxResult:
         lang = language.lower().strip()
+        if lang not in ("python", "go"):
+            raise ValueError(f"Unsupported sandbox language: {language}")
+
+        if self.stack_spec is not None:
+            return self._run_with_stack_spec(lang, test_code, target_subdir)
+
         if lang == "python":
             return self._run_python(test_code, target_subdir)
-        elif lang == "go":
-            return self._run_go(test_code, target_subdir)
+        return self._run_go(test_code, target_subdir)
+
+    def _run_with_stack_spec(
+        self,
+        lang: str,
+        test_code: str,
+        target_subdir: str,
+    ) -> SandboxResult:
+        run_id = uuid.uuid4().hex[:8]
+        start = time.perf_counter()
+
+        if lang == "go":
+            rel_dir = Path(target_subdir) if target_subdir else Path("backend/src")
+            rel_test_path = (rel_dir / f"repro_{run_id}_test.go").as_posix()
+            pkg_path = f"./{rel_dir.as_posix()}"
+            command = ["go", "test", "-v", "-run", "TestRepro", pkg_path]
+            env = None
         else:
-            raise ValueError(f"Unsupported sandbox language: {language}")
+            rel_dir = Path(target_subdir) if target_subdir else Path(".")
+            rel_test_path = (rel_dir / f"test_repro_{run_id}.py").as_posix()
+            container_test_path = f"/repo/{rel_test_path}"
+            base_cmd = self.stack_spec.test_command_by_lang.get(lang, "pytest -v --tb=short")
+            command = shlex.split(base_cmd) + [container_test_path]
+            env = {
+                "PYTHONPATH": "/repo/sdk/python:/repo",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+
+        return self._exec_in_container(
+            image=self.stack_spec.image_tag,
+            command=command,
+            language=lang,
+            start_time=start,
+            test_rel_path=rel_test_path,
+            test_code=test_code,
+            env=env,
+        )
 
     def _run_python(self, test_code: str, target_subdir: str) -> SandboxResult:
         run_id = uuid.uuid4().hex[:8]
@@ -89,7 +136,6 @@ class PolyglotSandbox:
         include_roots = ["sdk/python", "backend/src", "api", "kubernetes_platform"]
 
         with tarfile.open(fileobj=buf, mode="w") as tar:
-            # Include root go.mod / go.sum / pyproject.toml if present
             for root_file in ("go.mod", "go.sum", "pyproject.toml"):
                 rf_path = self.repo_dir / root_file
                 if rf_path.is_file():

@@ -12,6 +12,7 @@ from core import __version__
 from core.errors import friendly_error
 from core.github_client import fetch_github_item
 from core.graph import build_triage_graph
+from core.stack_detector import StackSpec
 
 _logo_path = Path(__file__).resolve().parent / "assets" / "kensho-logo.png"
 st.set_page_config(
@@ -23,9 +24,8 @@ st.set_page_config(
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE_DIR = ROOT / "workspace"
-LAST_RUN_PATH = WORKSPACE_DIR / "last_run.json"
+FALLBACK_REPO = "Snehadas2005/Kensho"
 PENDING_RUN_PATH = WORKSPACE_DIR / "pending_run.json"
-ALT_MAP_PATH = ROOT / ".kensho" / "repo_map.json"  # used when workspace/repo_map.json does not exist
 
 NODE_LABELS = {
     "triage": "Triage & localization",
@@ -111,31 +111,44 @@ def runtime_stack(repo_map: dict) -> str:
     return ", ".join(sorted(as_list(list(stack) if not isinstance(stack, (str, list)) else stack)))
 
 
-# ---------- state defaults ----------
-_boot_ctx = detect_repo_context(str(WORKSPACE_DIR / "notebooks"))
-st.session_state.setdefault("repo_name", _boot_ctx.get("upstream") or "kubeflow/notebooks")
+# ---------- state defaults & CLI handoff ----------
+# A pending request written by `git kensho issue <n>` / `pr <n>` always takes precedence.
+if PENDING_RUN_PATH.exists():
+    try:
+        st.session_state.update(json.loads(PENDING_RUN_PATH.read_text(encoding="utf-8")))
+        st.session_state["autorun"] = True
+        st.session_state["upstream_error"] = False
+    except (json.JSONDecodeError, OSError):
+        pass
+    finally:
+        PENDING_RUN_PATH.unlink(missing_ok=True)
+
+if "repo_name" not in st.session_state:
+    cwd_ctx = detect_repo_context(str(Path.cwd()))
+    detected_upstream = cwd_ctx.get("upstream") or ""
+    if detected_upstream and detected_upstream.lower() != FALLBACK_REPO.lower():
+        st.session_state["repo_name"] = detected_upstream
+        st.session_state["repo_dir"] = str(Path.cwd())
+        st.session_state["map_path"] = str(Path.cwd() / ".kensho" / "repo_map.json")
+        st.session_state["stack_path"] = str(Path.cwd() / ".kensho" / "stack_spec.json")
+        st.session_state["last_run_path"] = str(Path.cwd() / ".kensho" / "last_run.json")
+        st.session_state["upstream_error"] = False
+    else:
+        st.session_state["repo_name"] = FALLBACK_REPO
+        st.session_state["repo_dir"] = str(ROOT.parent)
+        st.session_state["map_path"] = str(ROOT.parent / ".kensho" / "repo_map.json")
+        st.session_state["stack_path"] = str(ROOT.parent / ".kensho" / "stack_spec.json")
+        st.session_state["last_run_path"] = str(WORKSPACE_DIR / "last_run.json")
+        st.session_state["upstream_error"] = True
+
 st.session_state.setdefault("item_type", "issue")
-st.session_state.setdefault("item_number", 1596)
+st.session_state.setdefault("item_number", 1)
 st.session_state.setdefault("max_retries", 2)
-st.session_state.setdefault("repo_dir", str(WORKSPACE_DIR / st.session_state["repo_name"].split("/")[-1]))
-st.session_state.setdefault("map_path", str(WORKSPACE_DIR / "repo_map.json"))
 
-# a pending request written by `kensho issue <n>` overrides the defaults once per session
-if "pending_checked" not in st.session_state:
-    st.session_state["pending_checked"] = True
-    if PENDING_RUN_PATH.exists():
-        try:
-            st.session_state.update(json.loads(PENDING_RUN_PATH.read_text(encoding="utf-8")))
-            st.session_state["autorun"] = True
-        except (json.JSONDecodeError, OSError):
-            pass
-        finally:
-            PENDING_RUN_PATH.unlink(missing_ok=True)
-
-REPO_DIR = Path(st.session_state["repo_dir"])
-MAP_PATH = Path(st.session_state["map_path"])
-if not MAP_PATH.exists() and ALT_MAP_PATH.exists():
-    MAP_PATH = ALT_MAP_PATH
+REPO_DIR = Path(st.session_state.get("repo_dir", str(ROOT.parent)))
+MAP_PATH = Path(st.session_state.get("map_path", str(REPO_DIR / ".kensho" / "repo_map.json")))
+STACK_PATH = Path(st.session_state.get("stack_path") or (REPO_DIR / ".kensho" / "stack_spec.json"))
+LAST_RUN_PATH = Path(st.session_state.get("last_run_path") or (REPO_DIR / ".kensho" / "last_run.json"))
 
 repo_map: dict = {}
 if MAP_PATH.exists():
@@ -143,6 +156,14 @@ if MAP_PATH.exists():
         repo_map = json.loads(MAP_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         repo_map = {}
+
+stack_spec: StackSpec | None = None
+if STACK_PATH.is_file():
+    try:
+        stack_spec = StackSpec.model_validate_json(STACK_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        stack_spec = None
+
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -157,7 +178,6 @@ with st.sidebar:
     run_btn = st.button("Run Triage & Repro", type="primary", use_container_width=True)
     run_btn = run_btn or st.session_state.pop("autorun", False)
 
-    # compact info block: user, fork/upstream, repo map, runtime stack, sandbox image
     ctx = detect_repo_context(str(REPO_DIR))
     token = os.environ.get("GITHUB_TOKEN", "")
     owner_fallback = (ctx.get("origin") or "").split("/")[0]
@@ -178,8 +198,10 @@ with st.sidebar:
         if stack:
             rows.append(row("Runtime stack", stack))
     elif MAP_PATH.exists():
-        rows.append('<div class="k-meta-warn">repo_map.json unreadable. Re-run <code>kensho index</code>.</div>')
-    image = "kensho-sandbox-" + re.sub(r"[^a-z0-9]+", "-", repo_name.lower()).strip("-") + ":latest"
+        rows.append('<div class="k-meta-warn">repo_map.json unreadable. Re-run <code>git kensho init</code>.</div>')
+    image = stack_spec.image_tag if stack_spec else (
+        "kensho-sandbox-" + re.sub(r"[^a-z0-9]+", "-", repo_name.lower()).strip("-") + ":latest"
+    )
     rows.append(row("Sandbox image", image))
     if not token:
         rows.append('<div class="k-meta-warn">⚠ GITHUB_TOKEN is not set (rate limits apply)</div>')
@@ -187,16 +209,18 @@ with st.sidebar:
 
 st.markdown(ui.build_css(mode), unsafe_allow_html=True)
 
+
 # ---------- Agent ----------
 def run_agent() -> dict | None:
     """Runs the graph, streaming node progress into the UI. Returns final state or None on failure."""
     try:
         with st.status("Running agent loop…", expanded=True) as status:
-            st.write("Fetching item from GitHub…")
+            st.write(f"Fetching {item_type} #{int(item_number)} from {repo_name}…")
             work_item = fetch_github_item(repo_name, int(item_number), item_type=item_type)
-            graph = build_triage_graph(REPO_DIR)
+            graph = build_triage_graph(REPO_DIR, stack_spec=stack_spec)
             initial = {
                 "repo_name": repo_name,
+                "repo_root": str(REPO_DIR),
                 "item_type": item_type,
                 "item_number": int(item_number),
                 "title": work_item.title,
@@ -228,13 +252,20 @@ def run_agent() -> dict | None:
 # ---------- Masthead ----------
 st.markdown(ui.masthead_html(__version__), unsafe_allow_html=True)
 
+if st.session_state.get("upstream_error") or repo_name.strip().lower() == FALLBACK_REPO.lower():
+    st.error(
+        f"Could not detect an upstream forked repository. Falling back to `{FALLBACK_REPO}`. "
+        "Run `git kensho issue <number>` from inside your initialized repository (`git kensho init`), "
+        f"or contact the owner at https://github.com/{FALLBACK_REPO}."
+    )
+
 # ---------- Load / run ----------
 state = None
 is_last_run = False
 
 if run_btn:
     if not MAP_PATH.exists():
-        st.error(f"`{MAP_PATH}` not found. Run `kensho index` in your terminal first.")
+        st.error(f"`{MAP_PATH}` not found. Run `git kensho init` inside your target repository first.")
     else:
         state = run_agent()
 elif LAST_RUN_PATH.exists():
@@ -245,7 +276,7 @@ elif LAST_RUN_PATH.exists():
         st.warning("`last_run.json` is corrupted. Run the agent again.")
 
 if not state or "verdict" not in state:
-    st.info("Pick an issue or PR in the sidebar and click **Run Triage & Repro**, or run `kensho issue <number>` in your terminal.")
+    st.info("Pick an issue or PR in the sidebar and click **Run Triage & Repro**, or run `git kensho issue <number>` in your terminal.")
     st.stop()
 
 # ---------- Results: banner + metrics ----------

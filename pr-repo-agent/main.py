@@ -1,23 +1,23 @@
 import json
+import os
 import subprocess
 import sys
-import os
 from pathlib import Path
+
 import typer
 from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.syntax import Syntax
 from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
 
 from core import __version__
 from core.errors import friendly_error
-from core.repo_indexer import build_initial_map, sync_repo_map
-from core.github_client import fetch_github_item
 from core.git_context import detect_repo_context
-from core.stack_detector import StackSpec, detect_stack, ensure_sandbox_image
+from core.github_client import fetch_github_item
 from core.graph import build_triage_graph
-
+from core.repo_indexer import build_initial_map, sync_repo_map
+from core.stack_detector import StackSpec, detect_stack, ensure_sandbox_image
 from memory.profiler import build_contributor_profile
 from memory.recommender import recommend_issues
 
@@ -30,9 +30,7 @@ console = Console()
 # Resolve paths from this file so the command works from any directory
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
-DEFAULT_REPO_DIR = WORKSPACE_DIR / "pipelines"
-DEFAULT_MAP_PATH = WORKSPACE_DIR / "repo_map.json"
-LAST_RUN_PATH = WORKSPACE_DIR / "last_run.json"
+FALLBACK_REPO = "Snehadas2005/Kensho"
 PENDING_RUN_PATH = WORKSPACE_DIR / "pending_run.json"
 
 NODE_LABELS = {
@@ -46,6 +44,50 @@ NODE_LABELS = {
 def _fail(exc: Exception) -> None:
     console.print(Panel(friendly_error(exc), title="Error", border_style="red"))
     raise typer.Exit(code=1)
+
+
+def _resolve_target(
+    repo: str | None,
+    repo_dir: Path | None,
+    map_path: Path | None,
+) -> tuple[str, Path, Path, Path | None, Path]:
+    """
+    Auto-detects the upstream repo, repo root, map, stack_spec, and last_run path
+    from the current git repository. Falls back to Snehadas2005/Kensho with a clear
+    error message if no upstream/forked repo can be detected.
+    """
+    try:
+        ctx = detect_repo_context()
+        return (
+            repo or ctx.upstream_repo,
+            repo_dir or ctx.repo_root,
+            map_path or ctx.map_path,
+            ctx.stack_path if ctx.stack_path.exists() else None,
+            ctx.last_run_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(
+            Panel(
+                f"[bold red]Could not detect an upstream forked repository from {Path.cwd()}.[/bold red]\n"
+                f"Reason: {exc}\n\n"
+                f"Falling back to [cyan]{FALLBACK_REPO}[/cyan].\n"
+                "To target your fork/upstream repo, `cd` into your cloned repository and run "
+                "[cyan]git kensho init[/cyan] first, or contact the maintainer at "
+                f"[underline]https://github.com/{FALLBACK_REPO}[/underline].",
+                title="Upstream Repo Not Detected",
+                border_style="red",
+            )
+        )
+        fallback_root = repo_dir or PROJECT_ROOT.parent
+        fallback_kensho = fallback_root / ".kensho"
+        return (
+            repo or FALLBACK_REPO,
+            fallback_root,
+            map_path or (fallback_kensho / "repo_map.json"),
+            (fallback_kensho / "stack_spec.json") if (fallback_kensho / "stack_spec.json").exists() else None,
+            fallback_kensho / "last_run.json",
+        )
+
 
 @app.command()
 def config(
@@ -66,6 +108,7 @@ def config(
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     console.print(f"[bold green]✓ Configuration saved successfully to {env_path}[/bold green]")
 
+
 @app.command()
 def init(
     rebuild_image: bool = typer.Option(False, "--rebuild-image", help="Force rebuild of cached repo Docker image"),
@@ -73,13 +116,19 @@ def init(
     """Detects fork/upstream remotes, indexes architecture, and provisions cached Docker sandbox."""
     _ensure_api_keys()
     ctx = detect_repo_context()
-    fork_badge = f"fork [cyan]{ctx.origin_repo}[/cyan] -> upstream [green]{ctx.upstream_repo}[/green]" if ctx.is_fork else f"[green]{ctx.upstream_repo}[/green]"
-    console.print(Panel(
-        f"[bold]Repository:[/bold] {fork_badge}\n"
-        f"[bold]Contributor:[/bold] @{ctx.github_username}\n"
-        f"[bold]State Dir:[/bold] {ctx.kensho_dir}",
-        title="Kensho v2 Context Detected",
-    ))
+    fork_badge = (
+        f"fork [cyan]{ctx.origin_repo}[/cyan] -> upstream [green]{ctx.upstream_repo}[/green]"
+        if ctx.is_fork
+        else f"[green]{ctx.upstream_repo}[/green]"
+    )
+    console.print(
+        Panel(
+            f"[bold]Repository:[/bold] {fork_badge}\n"
+            f"[bold]Contributor:[/bold] @{ctx.github_username}\n"
+            f"[bold]State Dir:[/bold] {ctx.kensho_dir}",
+            title="Kensho v2 Context Detected",
+        )
+    )
 
     with console.status(f"[bold cyan]Indexing {ctx.upstream_repo} architecture...[/bold cyan]"):
         repo_map = build_initial_map(ctx.upstream_repo, ctx.repo_root, ctx.map_path)
@@ -90,38 +139,45 @@ def init(
         (ctx.kensho_dir / "Dockerfile.sandbox").write_text(spec.dockerfile_content, encoding="utf-8")
         image_tag = ensure_sandbox_image(ctx.repo_root, spec, force_rebuild=rebuild_image)
 
-    console.print(Panel(
-        f"[bold green]Indexed {len(repo_map.modules)} modules[/bold green] (SHA [yellow]{repo_map.last_indexed_sha[:7]}[/yellow])\n"
-        f"[bold]Detected Stack:[/bold] {', '.join(spec.detected_languages)}\n"
-        f"[bold]Cached Sandbox Image:[/bold] [cyan]{image_tag}[/cyan]",
-        title="Repository Ready",
-    ))
+    console.print(
+        Panel(
+            f"[bold green]Indexed {len(repo_map.modules)} modules[/bold green] (SHA [yellow]{repo_map.last_indexed_sha[:7]}[/yellow])\n"
+            f"[bold]Detected Stack:[/bold] {', '.join(spec.detected_languages)}\n"
+            f"[bold]Cached Sandbox Image:[/bold] [cyan]{image_tag}[/cyan]",
+            title="Repository Ready",
+        )
+    )
+
 
 @app.command()
 def index(
-    repo: str = typer.Option("kubeflow/pipelines", help="GitHub owner/repo"),
-    repo_dir: Path = typer.Option(DEFAULT_REPO_DIR, help="Local clone path"),
-    map_path: Path = typer.Option(DEFAULT_MAP_PATH, help="Output repo_map.json path"),
+    repo: str | None = typer.Option(None, help="GitHub owner/repo (auto-detected if omitted)"),
+    repo_dir: Path | None = typer.Option(None, help="Local clone path"),
+    map_path: Path | None = typer.Option(None, help="Output repo_map.json path"),
 ):
     """Builds the initial Repo Architecture Map from docs and folder layout."""
+    repo, repo_dir, map_path, _, _ = _resolve_target(repo, repo_dir, map_path)
     try:
         with console.status(f"[bold cyan]Indexing {repo} architecture...[/bold cyan]"):
             repo_map = build_initial_map(repo, repo_dir, map_path)
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
-    console.print(Panel(
-        f"[bold green]Indexed {len(repo_map.modules)} modules[/bold green] at SHA [yellow]{repo_map.last_indexed_sha[:7]}[/yellow]\n"
-        f"Saved to: {map_path}",
-        title="Repo Architecture Map Ready",
-    ))
+    console.print(
+        Panel(
+            f"[bold green]Indexed {len(repo_map.modules)} modules[/bold green] at SHA [yellow]{repo_map.last_indexed_sha[:7]}[/yellow]\n"
+            f"Saved to: {map_path}",
+            title="Repo Architecture Map Ready",
+        )
+    )
 
 
 @app.command()
 def sync(
-    repo_dir: Path = typer.Option(DEFAULT_REPO_DIR, help="Local clone path"),
-    map_path: Path = typer.Option(DEFAULT_MAP_PATH, help="Existing repo_map.json path"),
+    repo_dir: Path | None = typer.Option(None, help="Local clone path"),
+    map_path: Path | None = typer.Option(None, help="Existing repo_map.json path"),
 ):
     """Pulls the latest commits and incrementally updates repo_map.json from the git diff."""
+    _, repo_dir, map_path, _, _ = _resolve_target(None, repo_dir, map_path)
     try:
         with console.status("[bold cyan]Syncing repo map with latest merged PRs...[/bold cyan]"):
             updated = sync_repo_map(repo_dir, map_path)
@@ -132,11 +188,23 @@ def sync(
 
 def _require_map(map_path: Path) -> None:
     if not map_path.exists():
-        console.print("[bold red]repo_map.json not found.[/bold red] Run `kensho index` first.")
+        console.print(
+            f"[bold red]repo_map.json not found at {map_path}.[/bold red] "
+            "Run [cyan]git kensho init[/cyan] inside your cloned repository first."
+        )
         raise typer.Exit(code=1)
 
 
-def _launch_ui(repo: str, number: int, item_type: str, repo_dir: Path, map_path: Path, max_retries: int):
+def _launch_ui(
+    repo: str,
+    number: int,
+    item_type: str,
+    repo_dir: Path,
+    map_path: Path,
+    max_retries: int,
+    stack_path: Path | None,
+    last_run_path: Path,
+):
     """Hands the request to the Streamlit app, which opens in the browser and runs it automatically."""
     _require_map(map_path)
     PENDING_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -148,10 +216,12 @@ def _launch_ui(repo: str, number: int, item_type: str, repo_dir: Path, map_path:
             "max_retries": max_retries,
             "repo_dir": str(repo_dir),
             "map_path": str(map_path),
+            "stack_path": str(stack_path) if stack_path else "",
+            "last_run_path": str(last_run_path),
         }),
         encoding="utf-8",
     )
-    console.print(f"[bold cyan]Opening Kensho UI for {item_type} #{number}...[/bold cyan] (Ctrl+C to stop)")
+    console.print(f"[bold cyan]Opening Kensho UI for {repo} {item_type} #{number}...[/bold cyan] (Ctrl+C to stop)")
     try:
         subprocess.run(
             [sys.executable, "-m", "streamlit", "run", str(PROJECT_ROOT / "app.py")],
@@ -169,17 +239,40 @@ def _ensure_api_keys() -> None:
         console.print("Please run [cyan]git kensho config[/cyan] first to set up your keys.")
         raise typer.Exit(code=1)
 
-def _run(repo: str, number: int, item_type: str, repo_dir: Path, map_path: Path, max_retries: int, cli: bool):
+
+def _run(
+    repo: str | None,
+    number: int,
+    item_type: str,
+    repo_dir: Path | None,
+    map_path: Path | None,
+    max_retries: int,
+    cli: bool,
+):
+    resolved_repo, resolved_dir, resolved_map, stack_path, last_run_path = _resolve_target(repo, repo_dir, map_path)
     if cli:
-        _execute_agent(repo, number, item_type, repo_dir, map_path, max_retries)
+        _execute_agent(resolved_repo, number, item_type, resolved_dir, resolved_map, max_retries, stack_path, last_run_path)
     else:
-        _launch_ui(repo, number, item_type, repo_dir, map_path, max_retries)
+        _launch_ui(resolved_repo, number, item_type, resolved_dir, resolved_map, max_retries, stack_path, last_run_path)
 
 
-def _execute_agent(repo: str, number: int, item_type: str, repo_dir: Path, map_path: Path, max_retries: int):
+def _execute_agent(
+    repo: str,
+    number: int,
+    item_type: str,
+    repo_dir: Path,
+    map_path: Path,
+    max_retries: int,
+    stack_path: Path | None,
+    last_run_path: Path,
+):
     _require_map(map_path)
-
     repo_map_json = map_path.read_text(encoding="utf-8")
+    stack_spec = (
+        StackSpec.model_validate_json(stack_path.read_text(encoding="utf-8"))
+        if stack_path and stack_path.exists()
+        else None
+    )
 
     try:
         with console.status(f"[bold cyan]Fetching {item_type.upper()} #{number} from {repo}...[/bold cyan]"):
@@ -187,9 +280,10 @@ def _execute_agent(repo: str, number: int, item_type: str, repo_dir: Path, map_p
 
         console.print(Panel(f"[bold]{work_item.title}[/bold]", title=f"{repo} #{number}"))
 
-        graph = build_triage_graph(repo_dir)
+        graph = build_triage_graph(repo_dir, stack_spec=stack_spec)
         initial_state = {
             "repo_name": repo,
+            "repo_root": str(repo_dir),
             "item_type": item_type,
             "item_number": number,
             "title": work_item.title,
@@ -210,42 +304,54 @@ def _execute_agent(repo: str, number: int, item_type: str, repo_dir: Path, map_p
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
 
-    # Save trace for Streamlit viewer
-    LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LAST_RUN_PATH.write_text(json.dumps(final_state, indent=2, default=str), encoding="utf-8")
+    last_run_path.parent.mkdir(parents=True, exist_ok=True)
+    last_run_path.write_text(json.dumps(final_state, indent=2, default=str), encoding="utf-8")
 
     verdict = final_state.get("verdict", {})
     status_text = verdict.get("status", "UNKNOWN")
     color = "green" if status_text == "VERIFIED" else ("yellow" if status_text == "NOT_REPRODUCED" else "red")
 
-    console.print(Panel(
-        f"[bold {color}]STATUS: {status_text}[/bold {color}]  |  "
-        f"Runtime: [cyan]{final_state.get('target_language')}[/cyan]  |  "
-        f"Attempts: {final_state.get('retry_count')}\n\n"
-        f"[bold]Suspect Files:[/bold] {', '.join(final_state.get('suspect_files', []))}\n"
-        f"[bold]Root Cause:[/bold] {verdict.get('root_cause_summary', '')}\n"
-        f"[bold]Fix Direction:[/bold] {verdict.get('suggested_fix_direction', '')}",
-        title="Agent Verdict",
-    ))
+    console.print(
+        Panel(
+            f"[bold {color}]STATUS: {status_text}[/bold {color}]  |  "
+            f"Runtime: [cyan]{final_state.get('target_language')}[/cyan]  |  "
+            f"Attempts: {final_state.get('retry_count')}\n\n"
+            f"[bold]Suspect Files:[/bold] {', '.join(final_state.get('suspect_files', []))}\n"
+            f"[bold]Root Cause:[/bold] {verdict.get('root_cause_summary', '')}\n"
+            f"[bold]Fix Direction:[/bold] {verdict.get('suggested_fix_direction', '')}",
+            title="Agent Verdict",
+        )
+    )
 
     console.print("\n[bold cyan]Generated Reproduction Test:[/bold cyan]")
-    console.print(Syntax(final_state.get("test_code", ""), final_state.get("target_language", "python"), theme="monokai", line_numbers=True))
+    console.print(
+        Syntax(
+            final_state.get("test_code", ""),
+            final_state.get("target_language", "python"),
+            theme="monokai",
+            line_numbers=True,
+        )
+    )
 
     console.print("\n[bold cyan]Ready-to-Post GitHub Markdown Report:[/bold cyan]")
     console.print(Panel(Markdown(verdict.get("github_markdown_report", "")), title="GitHub Comment Draft"))
+
 
 @app.command()
 def onboard():
     """Runs a 3-question interactive CLI onboarding interview to build your contributor profile."""
     ctx = detect_repo_context()
     profile = build_contributor_profile(ctx, console)
-    console.print(Panel(
-        f"[bold green]Profile saved to {ctx.kensho_dir / 'profile.json'}[/bold green]\n"
-        f"[bold]Focus Areas:[/bold] {', '.join(profile.focus_areas)}\n"
-        f"[bold]Preferred Subdirs:[/bold] {', '.join(profile.favorite_subdirs)}\n"
-        f"[italic]{profile.summary_bio}[/italic]",
-        title=f"Contributor Profile: @{profile.github_username}",
-    ))
+    console.print(
+        Panel(
+            f"[bold green]Profile saved to {ctx.kensho_dir / 'profile.json'}[/bold green]\n"
+            f"[bold]Focus Areas:[/bold] {', '.join(profile.focus_areas)}\n"
+            f"[bold]Preferred Subdirs:[/bold] {', '.join(profile.favorite_subdirs)}\n"
+            f"[italic]{profile.summary_bio}[/italic]",
+            title=f"Contributor Profile: @{profile.github_username}",
+        )
+    )
+
 
 @app.command()
 def recommend(
@@ -272,12 +378,13 @@ def recommend(
     console.print(table)
     console.print("\n[dim]To reproduce any recommended issue, run:[/dim] [cyan]git kensho issue <number>[/cyan]")
 
+
 @app.command()
 def issue(
     number: int = typer.Argument(..., help="GitHub Issue number"),
-    repo: str = typer.Option("kubeflow/pipelines", help="GitHub owner/repo"),
-    repo_dir: Path = typer.Option(DEFAULT_REPO_DIR),
-    map_path: Path = typer.Option(DEFAULT_MAP_PATH),
+    repo: str | None = typer.Option(None, help="GitHub owner/repo (auto-detected from git remote)"),
+    repo_dir: Path | None = typer.Option(None),
+    map_path: Path | None = typer.Option(None),
     max_retries: int = typer.Option(2, help="Max self-correction retries on test syntax/import errors"),
     cli: bool = typer.Option(False, "--cli", help="Terminal-only output (default opens the Streamlit UI)"),
 ):
@@ -288,9 +395,9 @@ def issue(
 @app.command()
 def pr(
     number: int = typer.Argument(..., help="GitHub Pull Request number"),
-    repo: str = typer.Option("kubeflow/pipelines", help="GitHub owner/repo"),
-    repo_dir: Path = typer.Option(DEFAULT_REPO_DIR),
-    map_path: Path = typer.Option(DEFAULT_MAP_PATH),
+    repo: str | None = typer.Option(None, help="GitHub owner/repo (auto-detected from git remote)"),
+    repo_dir: Path | None = typer.Option(None),
+    map_path: Path | None = typer.Option(None),
     max_retries: int = typer.Option(2, help="Max self-correction retries"),
     cli: bool = typer.Option(False, "--cli", help="Terminal-only output (default opens the Streamlit UI)"),
 ):
