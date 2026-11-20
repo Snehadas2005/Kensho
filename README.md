@@ -3,7 +3,7 @@
 </div>
 
 <p align="center">
-  <a href="https://github.com/Snehadas2005/Kensho/releases/tag/v1.0.0"><img alt="release" src="https://img.shields.io/badge/release-v1.0.0-7C83FD" /></a>
+  <a href="https://github.com/Snehadas2005/Kensho/releases/tag/v2.0.0"><img alt="release" src="https://img.shields.io/badge/release-v2.0.0-7C83FD" /></a>
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-blue" />
   <img alt="docker" src="https://img.shields.io/badge/sandbox-docker-2496ED" />
 </p>
