@@ -4,15 +4,17 @@ from pathlib import Path
 from github import Github
 from pydantic import BaseModel
 from core.llm import call_structured_llm
+from core.schemas import ContributorProfile  # noqa: F401  (moved to core/schemas.py; re-exported here)
 
 
-class ContributorProfile(BaseModel):
-    github_username: str
-    preferred_languages: list[str]
-    favorite_subdirs: list[str]
-    experience_level: str               # "beginner" | "intermediate" | "advanced"
-    focus_areas: list[str]              # e.g. ["sdk", "backend", "ui"]
-    summary_bio: str
+def load_profile(kensho_dir: Path) -> "ContributorProfile | None":
+    path = kensho_dir / "profile.json"
+    if not path.is_file():
+        return None
+    try:
+        return ContributorProfile.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class OnboardingInterviewResponse(BaseModel):

@@ -1,9 +1,23 @@
+import functools
+import re
+import sqlite3
+import time
 from pathlib import Path
 from langgraph.graph import StateGraph, END
-from core.llm import call_structured_llm
+from core.llm import (
+    call_structured_llm,
+    detail_text,
+    merge_detail,
+    pop_telemetry,
+    summarize_calls,
+    telemetry_node,
+)
 from core.schemas import AgentState, TriageDecision, ReproTestDraft, JudgeVerdict
-from core.tools import read_file_snippet, grep_codebase
+from core.tools import get_git_blame, grep_codebase, read_file_snippet
 from core.sandbox import PolyglotSandbox
+from core.ast_symbols import build_symbol_map, format_hits, load_symbol_map, save_symbol_map
+from core.checkout import create_pr_worktree, remove_pr_worktree
+from memory.updater import update_profile_from_run
 from memory.vector_store import RepoVectorMemory
 from core import guards
 from core.go_module import (
@@ -66,17 +80,128 @@ def _get_vector_memory(repo_root: Path) -> RepoVectorMemory:
     return RepoVectorMemory(kensho_dir)
 
 
+def _safe_save_run(repo_root: Path, state: dict) -> None:
+    """Stores the run in ChromaDB. Offline / model-download / disk errors must never fail a finished run."""
+    try:
+        _get_vector_memory(repo_root).save_run(state)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _symbol_map(kensho_dir: Path, repo_dir: Path):
+    """Cached tree-sitter symbol map; built (and cached) on first use if `init` has not made it yet."""
+    cached = load_symbol_map(kensho_dir)
+    if cached is not None and cached.files:
+        return cached
+    try:
+        fresh = build_symbol_map(repo_dir)
+        save_symbol_map(fresh, kensho_dir)
+        return fresh
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _identifiers(*texts: str, limit: int = 25) -> list[str]:
+    """CamelCase / snake_case identifiers from free text (deterministic AST lookup keys)."""
+    seen: list[str] = []
+    for text in texts:
+        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", text or ""):
+            if (any(c.isupper() for c in tok[1:]) or "_" in tok) and tok not in seen:
+                seen.append(tok)
+    return seen[:limit]
+
+
+def telemetered(node_name: str):
+    """Tags LLM calls inside a node and merges tokens/latency into state['model_telemetry']."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(state):
+            with telemetry_node(node_name):
+                delta = fn(state)
+            calls = pop_telemetry(node_name)
+            if calls:
+                _, detail = summarize_calls(calls)
+                details = dict(state.get("telemetry_detail") or {})
+                details[node_name] = merge_detail(details.get(node_name), detail)
+                delta = dict(delta or {})
+                delta["telemetry_detail"] = details
+                delta["model_telemetry"] = {k: detail_text(v) for k, v in details.items()}
+            return delta
+        return wrapper
+    return decorator
+
+
+class _ThreadedGraph:
+    """Adds a unique LangGraph thread_id so callers can keep using graph.stream(state, ...)."""
+
+    def __init__(self, compiled):
+        self._compiled = compiled
+
+    def _config(self, state, config):
+        if config:
+            return config
+        tid = f"{state.get('repo_name', 'repo')}-{state.get('item_type', 'item')}-{state.get('item_number', 0)}-{int(time.time())}"
+        return {"configurable": {"thread_id": tid}}
+
+    def stream(self, state, config=None, **kwargs):
+        return self._compiled.stream(state, self._config(state, config), **kwargs)
+
+    def invoke(self, state, config=None, **kwargs):
+        return self._compiled.invoke(state, self._config(state, config), **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._compiled, name)
+
+
+def _compile_with_checkpointer(workflow, repo_dir: Path):
+    """SQLite-persisted run state in <repo>/.kensho/checkpoints.sqlite (falls back to in-memory)."""
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        kensho_dir = repo_dir / ".kensho"
+        kensho_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(kensho_dir / "checkpoints.sqlite"), check_same_thread=False)
+        return _ThreadedGraph(workflow.compile(checkpointer=SqliteSaver(conn)))
+    except Exception:  # noqa: BLE001  (package missing / db locked: keep the agent usable)
+        return workflow.compile()
+
+
 def build_triage_graph(repo_dir: Path, stack_spec=None):
     sandbox = PolyglotSandbox(repo_dir=repo_dir, timeout_sec=180, stack_spec=stack_spec)
 
+    def _wd(state) -> Path:
+        """Directory the run operates on: the PR worktree if one was created, else the local repo."""
+        return Path(state.get("work_dir") or repo_dir)
+
+    def prepare_checkout_node(state: dict) -> dict:
+        if state.get("item_type") != "pr":
+            return {"work_dir": "", "checkout_note": ""}
+        path, note = create_pr_worktree(repo_dir, int(state["item_number"]))
+        return {"work_dir": str(path) if path else "", "checkout_note": note}
+
+    @telemetered("triage")
     def triage_node(state: dict) -> dict:
         repo_root = Path(state.get("repo_root", repo_dir))
+        wd = _wd(state)
         title = state.get("title", "")
         body = state.get("body", "")
-        
-        # RAG Semantic Memory Lookup
-        memory = _get_vector_memory(repo_root)
-        similar_bugs = memory.query_similar(title, body, top_k=2)
+        current_id = f"{state.get('item_type', 'issue')}-{state.get('item_number', 0)}"
+
+        # RAG Semantic Memory Lookup (never fatal: memory is an enhancement)
+        try:
+            memory = _get_vector_memory(repo_root)
+            similar_bugs = memory.query_similar(title, body, top_k=3, exclude_id=current_id)
+        except Exception:  # noqa: BLE001
+            similar_bugs = []
+
+        # Deterministic AST lookup: real symbols whose names appear in the issue text
+        symbol_map = _symbol_map(repo_root / ".kensho", wd)
+        ast_hits = symbol_map.find(_identifiers(title, body, state.get("diff_summary", "")[:2000])) if symbol_map else []
+        ast_section = (
+            "REAL CODE SYMBOLS MENTIONED IN THE ISSUE (tree-sitter, ground truth):\n"
+            + "\n".join(format_hits(ast_hits)) + "\n\n"
+            if ast_hits else ""
+        )
         
         rag_context = ""
         if similar_bugs:
@@ -84,7 +209,7 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
             for sb in similar_bugs:
                 rag_context += f"- [{sb.item_id}] {sb.title} ({sb.status})\n  Root Cause: {sb.root_cause}\n  Test Snippet:\n{sb.test_snippet[:400]}\n\n"
         
-        layout = layout_hint(repo_dir)
+        layout = layout_hint(wd)
         layout_section = (
             f"REAL ON-DISK LAYOUT (only use paths that appear here or in the map; never invent paths):\n{layout}\n\n"
             if layout else ""
@@ -98,6 +223,7 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
         user_prompt = (
             f"REPO ARCHITECTURE MAP:\n{state['repo_map_json']}\n\n"
             f"{layout_section}"
+            f"{ast_section}"
             f"{rag_context}"
             f"TYPE: {state['item_type'].upper()} #{state['item_number']}\n"
             f"TITLE: {state['title']}\n\n"
@@ -110,16 +236,24 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
         # The LLM sometimes invents paths. Keep only files that really exist (or resolve by basename).
         valid_files: list[str] = []
         for fpath in decision.suspect_files:
-            real = resolve_existing_path(repo_dir, fpath)
+            real = resolve_existing_path(wd, fpath)
             if real and real not in valid_files:
                 valid_files.append(real)
         if not valid_files and decision.target_language == "go":
-            mod_guess = find_go_module_root(repo_dir, decision.target_subdir, [])
+            mod_guess = find_go_module_root(wd, decision.target_subdir, [])
             if mod_guess is not None:
                 words = list(decision.search_keywords) + [title, decision.hypothesis]
-                valid_files = find_candidate_files(repo_dir, mod_guess, words)
+                valid_files = find_candidate_files(wd, mod_guess, words)
+        if not valid_files and symbol_map is not None:
+            # Language-agnostic fallback (covers Python too): files holding symbols named in the keywords
+            keyword_hits = symbol_map.find(list(decision.search_keywords) + _identifiers(title, body))
+            for path, _sym in keyword_hits:
+                if path not in valid_files and (wd / path).exists():
+                    valid_files.append(path)
+                if len(valid_files) >= 3:
+                    break
         target_subdir = decision.target_subdir
-        if not (repo_dir / target_subdir).exists():
+        if not (wd / target_subdir).exists():
             target_subdir = str(Path(valid_files[0]).parent.as_posix()) if valid_files else ""
         if target_subdir == ".":
             target_subdir = ""
@@ -131,22 +265,37 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
             "search_keywords": decision.search_keywords,
             "hypothesis": decision.hypothesis,
             "retry_count": 0,
+            "similar_prs": [m.model_dump() for m in similar_bugs],
+            "ast_hits": format_hits(ast_hits),
         }
 
+    @telemetered("explorer_coder")
     def explorer_coder_node(state: AgentState) -> dict:
+        wd = _wd(state)
         code_context = state.get("code_context", "")
+        blame_context = state.get("blame_context", "")
         if not code_context:
             snippets = []
             for fpath in state["suspect_files"][:4]:
-                snippets.append(read_file_snippet(repo_dir, fpath, start_line=1, max_lines=400))
+                snippets.append(read_file_snippet(wd, fpath, start_line=1, max_lines=400))
             for kw in state["search_keywords"][:3]:
-                snippets.append(f"=== GREP: {kw} ===\n" + grep_codebase(repo_dir, kw, subdir=state["target_subdir"]))
+                snippets.append(f"=== GREP: {kw} ===\n" + grep_codebase(wd, kw, subdir=state["target_subdir"]))
             code_context = "\n\n".join(snippets)[:24000]
+            # git blame around the most relevant lines of the first suspect file (recent changes = prime suspects)
+            if state["suspect_files"]:
+                first = state["suspect_files"][0]
+                line_no = 1
+                for hit in state.get("ast_hits") or []:
+                    if hit.startswith(f"{first}:"):
+                        line_no = int(hit.split(":")[1].split()[0])
+                        break
+                blame_context = get_git_blame(wd, first, max(1, line_no - 10), line_no + 30)[:3000]
+                code_context += "\n\n=== RECENT CHANGES (git blame) ===\n" + blame_context
             if state["target_language"] == "go":
-                mod_for_summary = find_go_module_root(repo_dir, state["target_subdir"], state["suspect_files"])
+                mod_for_summary = find_go_module_root(wd, state["target_subdir"], state["suspect_files"])
                 if mod_for_summary is not None:
                     prio = [str(Path(x).parent.as_posix()) for x in state["suspect_files"]]
-                    code_context = go_module_summary(repo_dir, mod_for_summary, prio) + "\n\n" + code_context
+                    code_context = go_module_summary(wd, mod_for_summary, prio) + "\n\n" + code_context
 
         retry_count = state.get("retry_count", 0)
         feedback_section = ""
@@ -162,10 +311,10 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
 
         go_pkg_note = ""
         if state["target_language"] == "go":
-            mod = find_go_module_root(repo_dir, state["target_subdir"], state["suspect_files"])
+            mod = find_go_module_root(wd, state["target_subdir"], state["suspect_files"])
             if mod is not None:
-                test_dir = resolve_go_test_dir(repo_dir, mod, state["target_subdir"], state["suspect_files"])
-                pkg = detect_go_package(repo_dir, test_dir)
+                test_dir = resolve_go_test_dir(wd, mod, state["target_subdir"], state["suspect_files"])
+                pkg = detect_go_package(wd, test_dir)
                 go_pkg_note = (
                     f" The test file will be placed in `{test_dir}` (Go module root `{mod}`)"
                     + (f" and MUST declare `package {pkg}`." if pkg else ".")
@@ -202,10 +351,13 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
         return {
             "code_context": code_context,
             "test_code": test_code,
+            "blame_context": blame_context,
         }
 
     def sandbox_node(state: AgentState) -> dict:
-        res = sandbox.run_repro(
+        wd = _wd(state)
+        runner = sandbox if wd == repo_dir else PolyglotSandbox(repo_dir=wd, timeout_sec=180, stack_spec=stack_spec)
+        res = runner.run_repro(
             language=state["target_language"],
             test_code=state["test_code"],
             target_subdir=state["target_subdir"],
@@ -219,15 +371,15 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
             "retry_count": state.get("retry_count", 0) + 1,
         }
 
+    @telemetered("judge")
     def judge_node(state: AgentState) -> dict:
         repo_root = Path(state.get("repo_root", repo_dir))
-        memory = _get_vector_memory(repo_root)
 
         forced = deterministic_verdict(state["exit_code"], state["stderr"]) or guards.deterministic_verdict(state)
         if forced is not None:
             verdict_dict = forced.model_dump()
             state["verdict"] = verdict_dict
-            memory.save_run(state)
+            _safe_save_run(repo_root, state)
             return {"verdict": verdict_dict}
 
         system_prompt = (
@@ -249,7 +401,7 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
         verdict_dict = verdict.model_dump()
         state["verdict"] = verdict_dict
         
-        memory.save_run(state)
+        _safe_save_run(repo_root, state)
         return {"verdict": verdict_dict}
 
     def route_after_judge(state: AgentState) -> str:
@@ -260,13 +412,28 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
             return "retry_coder"
         return "done"
 
+    def memory_updater_node(state: AgentState) -> dict:
+        """Post-run: update profile.json from this run, then remove the PR worktree."""
+        repo_root = Path(state.get("repo_root", repo_dir))
+        try:
+            update_profile_from_run(repo_root / ".kensho", dict(state))
+        except Exception:  # noqa: BLE001  (profile upkeep must never break a finished run)
+            pass
+        finally:
+            if state.get("work_dir"):
+                remove_pr_worktree(repo_dir, state.get("work_dir"), int(state.get("item_number", 0)) or None)
+        return {"checkout_note": state.get("checkout_note", "")}
+
     workflow = StateGraph(AgentState)
+    workflow.add_node("prepare_checkout", prepare_checkout_node)
     workflow.add_node("triage", triage_node)
     workflow.add_node("explorer_coder", explorer_coder_node)
     workflow.add_node("sandbox", sandbox_node)
     workflow.add_node("judge", judge_node)
+    workflow.add_node("memory_updater", memory_updater_node)
 
-    workflow.set_entry_point("triage")
+    workflow.set_entry_point("prepare_checkout")
+    workflow.add_edge("prepare_checkout", "triage")
     workflow.add_edge("triage", "explorer_coder")
     workflow.add_edge("explorer_coder", "sandbox")
     workflow.add_edge("sandbox", "judge")
@@ -275,8 +442,9 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
         route_after_judge,
         {
             "retry_coder": "explorer_coder",
-            "done": END,
+            "done": "memory_updater",
         },
     )
+    workflow.add_edge("memory_updater", END)
 
-    return workflow.compile()
+    return _compile_with_checkpointer(workflow, repo_dir)

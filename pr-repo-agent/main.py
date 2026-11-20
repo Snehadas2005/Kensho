@@ -19,7 +19,8 @@ from core.graph import build_triage_graph
 from core.repo_indexer import build_initial_map, sync_repo_map
 from core.stack_detector import StackSpec, detect_stack, ensure_sandbox_image
 from core.sandbox import PolyglotSandbox
-from memory.profiler import build_contributor_profile
+from memory.profiler import build_contributor_profile, load_profile
+from memory.updater import sync_profile_from_merged_prs
 from memory.recommender import recommend_issues
 
 app = typer.Typer(
@@ -29,7 +30,7 @@ app = typer.Typer(
 console = Console()
 
 def quiet_status(message: str):
-    """quiet_status() without stdout/stderr redirection.
+    """console.status() without stdout/stderr redirection.
 
     Rich's redirect swaps sys.stdout for a FileProxy; if any library (logging handler,
     background thread) keeps a reference, Python prints
@@ -371,6 +372,58 @@ def onboard():
             title=f"Contributor Profile: @{profile.github_username}",
         )
     )
+
+
+@app.command()
+def profile(
+    as_json: bool = typer.Option(False, "--json", help="Print the raw profile.json"),
+    sync: bool = typer.Option(False, "--sync", help="Learn from your newly merged upstream PRs (files, review comments, commits)"),
+    reset: bool = typer.Option(False, "--reset", help="Delete the saved profile (run `kensho onboard` to recreate it)"),
+):
+    """Shows (or syncs / resets) your saved contributor profile (.kensho/profile.json)."""
+    ctx = detect_repo_context()
+    profile_path = ctx.kensho_dir / "profile.json"
+
+    if reset:
+        if not profile_path.exists():
+            console.print("[yellow]No profile to reset.[/yellow]")
+            return
+        if typer.confirm(f"Delete {profile_path}?", default=False):
+            profile_path.unlink()
+            console.print("[green]Profile deleted. Run `git kensho onboard` to create a new one.[/green]")
+        return
+
+    if load_profile(ctx.kensho_dir) is None:
+        console.print("[bold red]No profile found. Run `git kensho onboard` first.[/bold red]")
+        raise typer.Exit(code=1)
+
+    if sync:
+        try:
+            with quiet_status("[bold cyan]Reading your newly merged PRs...[/bold cyan]"):
+                _, new_prs = sync_profile_from_merged_prs(ctx)
+        except Exception as exc:  # noqa: BLE001
+            _fail(exc)
+        console.print(f"[green]Profile updated from {new_prs} new merged PR(s).[/green]" if new_prs else "[dim]No new merged PRs since the last sync.[/dim]")
+
+    current = load_profile(ctx.kensho_dir)
+    if as_json:
+        console.print_json(current.model_dump_json())
+        return
+
+    table = Table(title=f"Contributor Profile: @{current.github_username}", show_header=False)
+    table.add_column("Field", style="bold cyan")
+    table.add_column("Value")
+    table.add_row("Experience", current.experience_level)
+    table.add_row("Languages", ", ".join(current.preferred_languages) or "-")
+    table.add_row("Focus areas", ", ".join(current.focus_areas) or "-")
+    table.add_row("Favorite subdirs", ", ".join(current.favorite_subdirs) or "-")
+    table.add_row("Focus modules (learned)", ", ".join(current.focus_modules) or "-")
+    table.add_row("Coding style", "; ".join(current.coding_style) or "-")
+    table.add_row("Review preferences", "; ".join(current.review_preferences) or "-")
+    table.add_row("Last merged PR synced", f"#{current.last_synced_pr}" if current.last_synced_pr else "-")
+    table.add_row("Updated", current.updated_at or "-")
+    table.add_row("Bio", current.summary_bio)
+    console.print(table)
 
 
 @app.command()

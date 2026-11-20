@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from pydantic import BaseModel, Field
 from core.llm import call_structured_llm
+from core.ast_symbols import build_symbol_map, save_symbol_map, symbol_digest
 
 
 class ModuleSummary(BaseModel):
@@ -55,11 +56,22 @@ def _read_key_docs(repo_dir: Path) -> str:
     return "\n\n".join(chunks)
 
 
+def _refresh_symbols(repo_dir: Path, map_path: Path, sha: str) -> str:
+    """Rebuilds .kensho/ast_symbols.json (tree-sitter, no LLM) and returns a prompt-sized digest."""
+    try:
+        symbol_map = build_symbol_map(repo_dir, root_sha=sha)
+        save_symbol_map(symbol_map, map_path.parent)
+        return symbol_digest(symbol_map, max_chars=5000)
+    except Exception:  # noqa: BLE001  (symbol index is an enhancement; never block indexing)
+        return "(symbol extraction unavailable)"
+
+
 def build_initial_map(repo_name: str, repo_dir: Path, output_path: Path) -> RepoArchitectureMap:
     """Builds the initial RepoArchitectureMap from markdown docs and folder layout."""
     head_sha = _run_git(repo_dir, ["rev-parse", "HEAD"])
     tree_str = _get_tree_summary(repo_dir, max_depth=3)
     docs_str = _read_key_docs(repo_dir)
+    symbols = _refresh_symbols(repo_dir, output_path, head_sha)
 
     system_prompt = (
         "You are a Senior Staff Software Architect. Analyze the repository's documentation "
@@ -69,6 +81,7 @@ def build_initial_map(repo_name: str, repo_dir: Path, output_path: Path) -> Repo
         f"Repository: {repo_name}\nHEAD SHA: {head_sha}\n\n"
         f"DIRECTORY STRUCTURE (depth 3):\n{tree_str}\n\n"
         f"KEY DOCUMENTATION & BUILD FILES:\n{docs_str}\n\n"
+        f"DETERMINISTIC CODE SYMBOLS (tree-sitter, ground truth; file: classes/functions):\n{symbols}\n\n"
         "Extract the core modules (especially Python and Go source/test directories) and their exact test commands."
     )
 
@@ -89,7 +102,11 @@ def sync_repo_map(repo_dir: Path, map_path: Path) -> RepoArchitectureMap:
     new_sha = _run_git(repo_dir, ["rev-parse", "HEAD"])
 
     if new_sha == existing.last_indexed_sha:
+        if not (map_path.parent / "ast_symbols.json").exists():
+            _refresh_symbols(repo_dir, map_path, new_sha)
         return existing
+
+    symbols = _refresh_symbols(repo_dir, map_path, new_sha)
 
     try:
         changed_files = _run_git(repo_dir, ["diff", "--name-only", existing.last_indexed_sha, new_sha])
@@ -108,6 +125,7 @@ def sync_repo_map(repo_dir: Path, map_path: Path) -> RepoArchitectureMap:
     user_prompt = (
         f"EXISTING MAP:\n{existing.model_dump_json(indent=2)}\n\n"
         f"FILES CHANGED BETWEEN {existing.last_indexed_sha[:7]} AND {new_sha[:7]}:\n{changed_files}\n\n"
+        f"CURRENT CODE SYMBOLS (tree-sitter):\n{symbols[:3000]}\n\n"
         "Return the updated RepoArchitectureMap."
     )
 

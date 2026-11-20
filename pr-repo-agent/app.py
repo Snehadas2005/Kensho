@@ -12,6 +12,7 @@ from core import __version__
 from core.errors import friendly_error
 from core.github_client import fetch_github_item
 from core.graph import build_triage_graph
+from core.schemas import ContributorProfile
 from core.stack_detector import StackSpec
 
 _logo_path = Path(__file__).resolve().parent / "assets" / "kensho-logo.png"
@@ -324,7 +325,9 @@ st.markdown(
 )
 
 # ---------- Tabs ----------
-tab_triage, tab_test, tab_sandbox, tab_report = st.tabs(["Triage", "Test", "Sandbox", "Report"])
+tab_triage, tab_test, tab_sandbox, tab_report, tab_similar, tab_profile = st.tabs(
+    ["Triage", "Test", "Sandbox", "Report", "Similar PRs", "Profile"]
+)
 
 with tab_triage:
     lang = str(state.get("target_language") or "—").lower()
@@ -363,6 +366,8 @@ with tab_test:
     )
 
 with tab_sandbox:
+    if state.get("checkout_note"):
+        st.markdown(f'<div class="k-line k-muted">{ui.esc(state["checkout_note"])}</div>', unsafe_allow_html=True)
     if exit_code == 0:
         meaning, pill_cls = "clean exit", ""
     elif exit_code == 124:
@@ -395,3 +400,49 @@ with tab_report:
     with col_prev:
         with st.container(border=True):
             st.markdown(report or "_(no report)_")
+
+with tab_similar:
+    similar = state.get("similar_prs") or []
+    if not similar:
+        st.markdown('<div class="k-list k-muted">No similar past bugs in memory yet. Verified and not-reproduced runs are saved automatically and show up here next time.</div>', unsafe_allow_html=True)
+    for match in similar:
+        pill_cls = "" if match.get("status") == "VERIFIED" else "err"
+        with st.container(border=True):
+            st.markdown(
+                f'<div class="k-line"><b>{ui.esc(match.get("item_id", ""))}</b> · {ui.esc(match.get("title", ""))} '
+                f'<span class="k-pill {pill_cls}">{ui.esc(match.get("status", ""))}</span> '
+                f'<span class="k-muted">distance {ui.esc(match.get("distance", ""))}</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(f"**Root cause:** {match.get('root_cause', '') or '—'}")
+            if match.get("test_snippet"):
+                with st.expander("Test snippet"):
+                    st.code(match["test_snippet"], language=str(state.get("target_language") or "python").lower())
+
+with tab_profile:
+    profile_path = REPO_DIR / ".kensho" / "profile.json"
+    profile = None
+    if profile_path.exists():
+        try:
+            profile = ContributorProfile.model_validate_json(profile_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            st.warning("`.kensho/profile.json` could not be read. Run `git kensho onboard` again.")
+    if profile is None:
+        st.markdown('<div class="k-list k-muted">No contributor profile yet. Run <code>git kensho onboard</code> in your terminal.</div>', unsafe_allow_html=True)
+    else:
+        def chips_html(values: list[str]) -> str:
+            return "".join(f'<span class="k-chip">{ui.esc(v)}</span>' for v in values) or '<span class="k-muted">—</span>'
+
+        st.markdown(f'<div class="k-line"><b>@{ui.esc(profile.github_username)}</b> · {ui.esc(profile.experience_level)}</div>', unsafe_allow_html=True)
+        st.markdown(profile.summary_bio or "—")
+        st.markdown(f'<div class="k-line"><b>Languages:</b> {chips_html(profile.preferred_languages)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="k-line"><b>Focus areas:</b> {chips_html(profile.focus_areas)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="k-line"><b>Focus modules</b> <span class="k-muted">(learned from your runs and merged PRs)</span>: {chips_html(profile.focus_modules)}</div>', unsafe_allow_html=True)
+        for title, notes in (("Coding style", profile.coding_style), ("Review preferences", profile.review_preferences)):
+            st.markdown(f'<div class="k-line"><b>{title}</b></div>', unsafe_allow_html=True)
+            if notes:
+                st.markdown(f'<ul class="k-list">{"".join(f"<li>{ui.esc(n)}</li>" for n in notes)}</ul>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="k-list k-muted">Nothing learned yet. Run <code>git kensho profile --sync</code> after you merge a PR.</div>', unsafe_allow_html=True)
+        if profile.updated_at:
+            st.markdown(f'<div class="k-line k-muted">Last updated {ui.esc(profile.updated_at)} · last merged PR synced: #{ui.esc(profile.last_synced_pr or "—")}</div>', unsafe_allow_html=True)

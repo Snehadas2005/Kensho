@@ -1,27 +1,25 @@
 from pathlib import Path
+
 import chromadb
-from pydantic import BaseModel
 
+from core.schemas import SimilarPRMatch
 
-class SimilarBugMatch(BaseModel):
-    item_id: str
-    title: str
-    status: str
-    root_cause: str
-    test_snippet: str
-    distance: float
+# Backwards-compatible alias (older code imported SimilarBugMatch from here).
+SimilarBugMatch = SimilarPRMatch
 
 
 class RepoVectorMemory:
     """Local per-repo ChromaDB vector store for verified bug reproductions & root causes."""
 
-    def __init__(self, kensho_dir: Path):
+    def __init__(self, kensho_dir: Path, embedding_function=None):
         db_path = kensho_dir / "chroma_db"
         db_path.mkdir(parents=True, exist_ok=True)
         self.client = chromadb.PersistentClient(path=str(db_path))
+        kwargs = {"embedding_function": embedding_function} if embedding_function is not None else {}
         self.collection = self.client.get_or_create_collection(
             name="kensho_repro_cases",
             metadata={"hnsw:space": "cosine"},
+            **kwargs,
         )
 
     def save_run(self, state: dict) -> None:
@@ -49,23 +47,26 @@ class RepoVectorMemory:
             }],
         )
 
-    def query_similar(self, title: str, body: str, top_k: int = 3) -> list[SimilarBugMatch]:
-        """Retrieves top-k past triaged bugs in this repository."""
-        if self.collection.count() == 0:
+    def query_similar(self, title: str, body: str, top_k: int = 3, exclude_id: str = "") -> list[SimilarPRMatch]:
+        """Retrieves top-k past triaged bugs in this repository (optionally excluding the current item)."""
+        total = self.collection.count()
+        if total == 0:
             return []
 
-        n = min(top_k, self.collection.count())
+        n = min(top_k + (1 if exclude_id else 0), total)
         results = self.collection.query(
-            query_texts=[f"{title}\n{body[:1200]}"],
+            query_texts=[f"{title}\n{(body or '')[:1200]}"],
             n_results=n,
         )
-        matches: list[SimilarBugMatch] = []
         ids = results.get("ids", [[]])[0]
         metas = results.get("metadatas", [[]])[0]
         dists = results.get("distances", [[]])[0]
 
+        matches: list[SimilarPRMatch] = []
         for idx, meta, dist in zip(ids, metas, dists):
-            matches.append(SimilarBugMatch(
+            if exclude_id and idx == exclude_id:
+                continue
+            matches.append(SimilarPRMatch(
                 item_id=idx,
                 title=meta.get("title", ""),
                 status=meta.get("status", ""),
@@ -73,4 +74,4 @@ class RepoVectorMemory:
                 test_snippet=meta.get("test_snippet", ""),
                 distance=round(float(dist), 4),
             ))
-        return matches
+        return matches[:top_k]

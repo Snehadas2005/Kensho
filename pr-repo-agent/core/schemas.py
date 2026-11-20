@@ -72,3 +72,71 @@ class AgentState(TypedDict):
     retry_count: int
     max_retries: int
     verdict: dict
+
+    # v2 add-ons
+    repo_root: str
+    work_dir: str                 # PR worktree used for the run (empty = local working tree)
+    checkout_note: str
+    similar_prs: list[dict]       # SimilarPRMatch dicts retrieved during triage
+    ast_hits: list[str]           # deterministic AST symbol matches shown to the LLM
+    blame_context: str
+    model_telemetry: dict         # node -> "model · tokens · latency" (rendered by app.py)
+    telemetry_detail: dict        # node -> raw numbers
+
+
+# ----------------------------------------------------------------------------------------
+# v2 add-ons: RAG matches, deterministic AST symbols, contributor profile
+# ----------------------------------------------------------------------------------------
+class SimilarPRMatch(BaseModel):
+    """A past triaged bug / PR retrieved from ChromaDB (structured RAG match)."""
+    item_id: str
+    title: str
+    status: str
+    root_cause: str
+    test_snippet: str = ""
+    distance: float = 0.0
+
+
+class ASTSymbol(BaseModel):
+    kind: str                 # "function" | "method" | "class" | "struct" | "interface" | "type"
+    name: str
+    signature: str
+    line: int
+    parent: str = ""          # enclosing class / receiver type, if any
+
+
+class ASTSymbolMap(BaseModel):
+    """Deterministic (tree-sitter) symbol index: file path -> symbols. No LLM involved."""
+    root_sha: str = ""
+    files: dict[str, list[ASTSymbol]] = Field(default_factory=dict)
+
+    def find(self, names: list[str], limit: int = 12) -> list[tuple[str, ASTSymbol]]:
+        """Symbols whose name contains any of `names` (case-insensitive), best matches first."""
+        wanted = [n.lower() for n in names if n and len(n) >= 3]
+        scored: list[tuple[int, str, ASTSymbol]] = []
+        for path, symbols in self.files.items():
+            for sym in symbols:
+                low = sym.name.lower()
+                score = max((3 if low == w else 2 if w in low else 0) for w in wanted) if wanted else 0
+                if score:
+                    scored.append((score, path, sym))
+        scored.sort(key=lambda x: (-x[0], x[1], x[2].line))
+        return [(path, sym) for _, path, sym in scored[:limit]]
+
+
+class ContributorProfile(BaseModel):
+    """Moved here from memory/profiler.py. New fields have defaults so old profile.json files still load."""
+    github_username: str
+    preferred_languages: list[str]
+    favorite_subdirs: list[str]
+    experience_level: str               # "beginner" | "intermediate" | "advanced"
+    focus_areas: list[str]              # e.g. ["sdk", "backend", "ui"]
+    summary_bio: str
+    # --- maintained automatically by memory/updater.py ---
+    focus_modules: list[str] = Field(default_factory=list)
+    coding_style: list[str] = Field(default_factory=list)
+    review_preferences: list[str] = Field(default_factory=list)
+    module_counts: dict[str, int] = Field(default_factory=dict)
+    language_counts: dict[str, int] = Field(default_factory=dict)
+    last_synced_pr: int = 0
+    updated_at: str = ""
