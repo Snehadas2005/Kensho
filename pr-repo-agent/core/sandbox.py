@@ -144,18 +144,14 @@ class PolyglotSandbox:
         container_workdir = "/repo" if module_root == "." else f"/repo/{module_root}"
 
         extra_dirs = local_replace_dirs(self.repo_dir, module_root)
-        base_tar = self._build_go_tar(module_root, extra_dirs, None, "")
         full_tar = self._build_go_tar(module_root, extra_dirs, rel_test_path, test_code)
+        go_cmd = ["go", "test", "-v", "-count=1", "-vet=off", f"-gcflags={GO_FAST_GCFLAGS}", "-run", "TestRepro", pkg_path]
+        run_timeout = max(self.timeout_sec, GO_TEST_MIN_TIMEOUT_SEC)
 
-        # Phase 1: networked, cached dependency download (the test run itself has no network).
-        dep_error = self._prepare_go_deps(image, base_tar, container_workdir, pkg_path)
-        if dep_error:
-            return self._env_error("go", start, dep_error)
-
-        # Phase 2: offline test run against the cached modules.
-        return self._exec_in_container(
+        # Fast path: run offline against cached volumes (skips extra container + double tar upload)
+        res = self._exec_in_container(
             image=image,
-            command=["go", "test", "-v", "-count=1", "-vet=off", f"-gcflags={GO_FAST_GCFLAGS}", "-run", "TestRepro", pkg_path],
+            command=go_cmd,
             language="go",
             start_time=start,
             tar_bytes=full_tar,
@@ -163,8 +159,28 @@ class PolyglotSandbox:
             workdir=container_workdir,
             volumes=self._go_volumes(),
             mem_limit="4g",
-            timeout_sec=max(self.timeout_sec, GO_TEST_MIN_TIMEOUT_SEC),
+            timeout_sec=run_timeout,
         )
+
+        # Only download deps if offline cache missed a module
+        if res.exit_code != 0 and any(m in res.stderr for m in ("missing go.sum", "no required module", "GOPROXY=off")):
+            base_tar = self._build_go_tar(module_root, extra_dirs, None, "")
+            dep_error = self._prepare_go_deps(image, base_tar, container_workdir, pkg_path)
+            if dep_error:
+                return self._env_error("go", start, dep_error)
+            res = self._exec_in_container(
+                image=image,
+                command=go_cmd,
+                language="go",
+                start_time=start,
+                tar_bytes=full_tar,
+                env=self._go_env(offline=True),
+                workdir=container_workdir,
+                volumes=self._go_volumes(),
+                mem_limit="4g",
+                timeout_sec=run_timeout,
+            )
+        return res
 
     @staticmethod
     def _go_env(offline: bool) -> dict[str, str]:

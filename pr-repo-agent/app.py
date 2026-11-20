@@ -15,10 +15,14 @@ from core.graph import build_triage_graph
 from core.schemas import ContributorProfile
 from core.stack_detector import StackSpec
 
-_logo_path = Path(__file__).resolve().parent / "assets" / "kensho-logo.png"
+_app_dir = Path(__file__).resolve().parent
+_logo_path = next(
+    (p for p in (_app_dir / "assets" / "kensho-logo.png", _app_dir.parent / "assets" / "kensho-logo.png") if p.is_file()),
+    None,
+)
 st.set_page_config(
     page_title="Kensho",
-    page_icon=str(_logo_path) if _logo_path.is_file() else "🔍",
+    page_icon=str(_logo_path) if _logo_path else "🔍",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -171,8 +175,12 @@ with st.sidebar:
     mode = ui.theme_toggle("Theme")
     st.markdown(ui.sidebar_title_html("Target"), unsafe_allow_html=True)
     repo_name = st.text_input("GitHub repository", key="repo_name")
-    item_type = st.selectbox(
-        "Item Type", ["issue", "pr"], key="item_type", format_func=lambda v: {"issue": "Issue", "pr": "PR"}[v]
+    item_type = st.session_state.get("item_type", "issue")
+    item_label = "PR" if item_type == "pr" else "Issue"
+    st.markdown(
+        '<div class="k-field-label">Item Type</div>'
+        f'<div class="k-static-box">{ui.esc(item_label)}</div>',
+        unsafe_allow_html=True,
     )
     item_number = st.number_input("Issue / PR Number", min_value=1, step=1, key="item_number")
     max_retries = st.slider("Maximum self-correction retries", 0, 3, key="max_retries")

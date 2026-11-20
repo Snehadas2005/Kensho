@@ -1,12 +1,11 @@
-"""Isolated checkout of a PR's code for the sandbox (never touches the user's working tree)."""
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 
-def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True, text=True)
+def _git(repo_dir: Path, *args: str, timeout: int = 45) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True, text=True, timeout=timeout)
 
 
 def pr_remote(repo_dir: Path) -> str:
@@ -25,7 +24,7 @@ def create_pr_worktree(repo_dir: Path, pr_number: int) -> tuple[Path | None, str
     ref = f"refs/kensho/pr-{pr_number}"
     remote = pr_remote(repo_dir)
 
-    fetched = _git(repo_dir, "fetch", "--quiet", remote, f"+pull/{pr_number}/head:{ref}")
+    fetched = _git(repo_dir, "fetch", "--quiet", "--depth=1", remote, f"+pull/{pr_number}/head:{ref}", timeout=45)
     if fetched.returncode != 0:
         return None, f"Could not fetch PR #{pr_number} from '{remote}' ({fetched.stderr.strip()[:160]}); using local working tree."
 

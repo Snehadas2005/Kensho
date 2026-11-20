@@ -44,10 +44,6 @@ _LAST_MODEL: str = MODEL_CHAIN[0][0]
 def get_last_model() -> str:
     return _LAST_MODEL
 
-
-# ----------------------------------------------------------------------------------------
-# Telemetry: per-node token counts + latency (feeds state["model_telemetry"] -> UI "Models")
-# ----------------------------------------------------------------------------------------
 _TELEMETRY_LOCK = threading.Lock()
 _CURRENT_NODE: str = "unknown"
 _CALLS: list[dict] = []
@@ -108,7 +104,7 @@ def call_structured_llm(
     system_prompt: str,
     user_prompt: str,
     response_schema: Type[T],
-    timeout_sec: int = 20,
+    timeout_sec: int = 12,
 ) -> T:
     global _LAST_MODEL
     last_error = None

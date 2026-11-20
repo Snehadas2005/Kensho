@@ -297,6 +297,29 @@ html, body {
         var(--bg-y);
 }
 
+.k-field-label {
+    font-family: var(--f-label);
+    font-style: italic;
+    font-size: var(--side-fs-label);
+    color: var(--side-text);
+    line-height: 1.25;
+    margin-bottom: 0.25rem;
+}
+.k-static-box {
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: var(--side-radius);
+    min-height: var(--side-input-h);
+    display: flex;
+    align-items: center;
+    padding: 0 0.75rem;
+    font-family: var(--f-ui);
+    font-weight: 300;
+    font-size: var(--side-fs-input);
+    color: var(--side-text);
+}
+
+
 [data-testid="stAppViewContainer"],
 [data-testid="stMain"],
 [data-testid="stMainBlockContainer"],

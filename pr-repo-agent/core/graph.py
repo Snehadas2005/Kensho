@@ -257,11 +257,17 @@ def build_triage_graph(repo_dir: Path, stack_spec=None):
             target_subdir = str(Path(valid_files[0]).parent.as_posix()) if valid_files else ""
         if target_subdir == ".":
             target_subdir = ""
+        target_language = decision.target_language
+        chosen_files = valid_files or decision.suspect_files
+        if chosen_files and all(f.endswith(".go") for f in chosen_files):
+            target_language = "go"
+        elif chosen_files and all(f.endswith(".py") for f in chosen_files):
+            target_language = "python"
 
         return {
-            "target_language": decision.target_language,
+            "target_language": target_language,
             "target_subdir": target_subdir,
-            "suspect_files": valid_files or decision.suspect_files,
+            "suspect_files": chosen_files,
             "search_keywords": decision.search_keywords,
             "hypothesis": decision.hypothesis,
             "retry_count": 0,
