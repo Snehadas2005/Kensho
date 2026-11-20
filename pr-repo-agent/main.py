@@ -18,6 +18,7 @@ from core.github_client import fetch_github_item
 from core.graph import build_triage_graph
 from core.repo_indexer import build_initial_map, sync_repo_map
 from core.stack_detector import StackSpec, detect_stack, ensure_sandbox_image
+from core.sandbox import PolyglotSandbox
 from memory.profiler import build_contributor_profile
 from memory.recommender import recommend_issues
 
@@ -26,6 +27,19 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 console = Console()
+
+def quiet_status(message: str):
+    """quiet_status() without stdout/stderr redirection.
+
+    Rich's redirect swaps sys.stdout for a FileProxy; if any library (logging handler,
+    background thread) keeps a reference, Python prints
+    'Exception ignored ... FileProxy ... sys.meta_path is None' on exit.
+    """
+    from rich.status import Status
+    status = Status(message, console=console)
+    status._live._redirect_stdout = False
+    status._live._redirect_stderr = False
+    return status
 
 # Resolve paths from this file so the command works from any directory
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -130,14 +144,20 @@ def init(
         )
     )
 
-    with console.status(f"[bold cyan]Indexing {ctx.upstream_repo} architecture...[/bold cyan]"):
+    with quiet_status(f"[bold cyan]Indexing {ctx.upstream_repo} architecture...[/bold cyan]"):
         repo_map = build_initial_map(ctx.upstream_repo, ctx.repo_root, ctx.map_path)
 
-    with console.status("[bold cyan]Detecting tech stack & provisioning cached Docker sandbox...[/bold cyan]"):
+    with quiet_status("[bold cyan]Detecting tech stack & provisioning cached Docker sandbox...[/bold cyan]"):
         spec = detect_stack(ctx.repo_root, ctx.upstream_repo)
         ctx.stack_path.write_text(spec.model_dump_json(indent=2), encoding="utf-8")
         (ctx.kensho_dir / "Dockerfile.sandbox").write_text(spec.dockerfile_content, encoding="utf-8")
         image_tag = ensure_sandbox_image(ctx.repo_root, spec, force_rebuild=rebuild_image)
+
+    if "go" in spec.detected_languages:
+        with quiet_status("[bold cyan]Pre-compiling Go dependencies (one-time, cached; later runs take seconds)...[/bold cyan]"):
+            go_warm_error = PolyglotSandbox(ctx.repo_root, stack_spec=spec).warm_go_cache(image_tag)
+        if go_warm_error:
+            console.print(Panel(go_warm_error, title="Go pre-compile did not finish (run `git kensho init` again to resume)", border_style="yellow"))
 
     console.print(
         Panel(
@@ -158,7 +178,7 @@ def index(
     """Builds the initial Repo Architecture Map from docs and folder layout."""
     repo, repo_dir, map_path, _, _ = _resolve_target(repo, repo_dir, map_path)
     try:
-        with console.status(f"[bold cyan]Indexing {repo} architecture...[/bold cyan]"):
+        with quiet_status(f"[bold cyan]Indexing {repo} architecture...[/bold cyan]"):
             repo_map = build_initial_map(repo, repo_dir, map_path)
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
@@ -179,7 +199,7 @@ def sync(
     """Pulls the latest commits and incrementally updates repo_map.json from the git diff."""
     _, repo_dir, map_path, _, _ = _resolve_target(None, repo_dir, map_path)
     try:
-        with console.status("[bold cyan]Syncing repo map with latest merged PRs...[/bold cyan]"):
+        with quiet_status("[bold cyan]Syncing repo map with latest merged PRs...[/bold cyan]"):
             updated = sync_repo_map(repo_dir, map_path)
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
@@ -275,7 +295,7 @@ def _execute_agent(
     )
 
     try:
-        with console.status(f"[bold cyan]Fetching {item_type.upper()} #{number} from {repo}...[/bold cyan]"):
+        with quiet_status(f"[bold cyan]Fetching {item_type.upper()} #{number} from {repo}...[/bold cyan]"):
             work_item = fetch_github_item(repo, number, item_type=item_type)
 
         console.print(Panel(f"[bold]{work_item.title}[/bold]", title=f"{repo} #{number}"))
@@ -295,7 +315,7 @@ def _execute_agent(
         }
 
         final_state = dict(initial_state)
-        with console.status("[bold cyan]Starting agent loop...[/bold cyan]") as status:
+        with quiet_status("[bold cyan]Starting agent loop...[/bold cyan]") as status:
             for update in graph.stream(initial_state, stream_mode="updates"):
                 for node, delta in update.items():
                     final_state.update(delta or {})
@@ -359,7 +379,7 @@ def recommend(
 ):
     """Ranks open upstream issues matched to your contributor profile and repo map."""
     ctx = detect_repo_context()
-    with console.status("[bold cyan]Analyzing open issues & matching against your profile...[/bold cyan]"):
+    with quiet_status("[bold cyan]Analyzing open issues & matching against your profile...[/bold cyan]"):
         recs = recommend_issues(ctx, console, top_n=top)
 
     if not recs:
